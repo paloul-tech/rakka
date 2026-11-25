@@ -2110,6 +2110,11 @@ const TURN_BUDGET_TASK_STORE_WRITES: usize = 8;
 /// The workflow outbox's share: register the ticket, mark it dispatching,
 /// settle it.
 const TURN_BUDGET_WORKFLOW_STORE_WRITES: usize = 3;
+/// How many times one clean turn loads the run's workflow record: every
+/// reader counts, the run's effect flush and the dispatcher's passes alike
+/// (issue #25). A load is a round trip on a real store, and the flush re-reads
+/// on every settle, so it is budgeted like the writes are.
+const TURN_BUDGET_WORKFLOW_STORE_LOADS: usize = 8;
 
 #[tokio::test]
 async fn per_turn_durable_write_count_and_latency_measurement() {
@@ -2129,6 +2134,7 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     fx.fx.runs.reset_writes();
     fx.fx.tasks.reset_writes();
     fx.workflow_store.reset_writes();
+    fx.workflow_store.reset_loads();
 
     let started = std::time::Instant::now();
     fx.fx.create_task().await;
@@ -2144,10 +2150,12 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     let run_writes = fx.fx.runs.writes();
     let task_writes = fx.fx.tasks.writes();
     let workflow_writes = fx.workflow_store.writes();
+    let workflow_loads = fx.workflow_store.loads();
     println!(
         "one full turn (accept -> model effect -> ticket -> claim -> invoke -> deliver -> \
          propose -> accept): run-store writes = {run_writes}, task-store writes = \
-         {task_writes}, workflow-store writes = {workflow_writes}, wall time = {elapsed:?}"
+         {task_writes}, workflow-store writes = {workflow_writes}, workflow-store loads = \
+         {workflow_loads}, wall time = {elapsed:?}"
     );
 
     assert_eq!(
@@ -2163,6 +2171,11 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     assert_eq!(
         workflow_writes, TURN_BUDGET_WORKFLOW_STORE_WRITES,
         "the per-turn workflow-store budget moved; a deliberate pipeline change must \
+         re-derive the budget constant and the example README together"
+    );
+    assert_eq!(
+        workflow_loads, TURN_BUDGET_WORKFLOW_STORE_LOADS,
+        "the per-turn workflow-store load budget moved; a deliberate pipeline change must \
          re-derive the budget constant and the example README together"
     );
 }
@@ -2777,6 +2790,116 @@ async fn a_post_terminal_promotion_survives_the_wind_down_fence() {
     let after = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(after.status, before.status);
     assert_eq!(after.terminal_at, before.terminal_at);
+}
+
+/// Issue #25, review focus 1: a winding-down run's flush hands over only its
+/// fence-exempt effects, and in one load. The run has three tool effects and a
+/// memory promotion `Ready` when it is cancelled; after its workflow record is
+/// lost, one settle puts back the promotion's row in one load, and none of the
+/// tool rows the fence stopped.
+#[tokio::test]
+async fn a_winding_down_run_puts_back_only_its_exempt_row_in_one_load() {
+    use rakka_agent::{
+        AgentOperationId, AgentOperationKind, AgentRunMemory, InMemoryAgentPrivateMemoryStore,
+        InMemoryContextSnapshotStore, InMemorySessionMemoryStore, SessionMemoryPromotionExecutor,
+    };
+    use rakka_persistence::DurableStateStore as _;
+
+    let session = Arc::new(InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    let private = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let call = |id: &str| {
+        AgentToolCallRequest::new(
+            AgentToolCallId::new(id).expect("call id should be valid"),
+            AgentToolId::new(TOOL).expect("tool id should be valid"),
+            serde_json::json!({ "amount": 42 }),
+        )
+        .expect("the tool call is bounded")
+    };
+    let three_calls = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_tool_call(call("call-1"))
+        .with_tool_call(call("call-2"))
+        .with_tool_call(call("call-3"));
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn(three_calls)
+            .with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_promotions(
+        AgentRunMemory::new(session.clone(), snapshots).with_private_store(private.clone()),
+        Arc::new(SessionMemoryPromotionExecutor::new(session, private)),
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    apply_to_run(&fx, post_terminal_promotion_command("live-1")).await;
+    fx.settle().await;
+    apply_to_run(
+        &fx,
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+
+    let ready = loop_state(&fx).await.ready_effects();
+    assert!(
+        ready
+            .iter()
+            .any(|effect| !effect.kind().exempt_from_wind_down_fence()),
+        "a fenced effect is ready: {ready:?}"
+    );
+    assert!(
+        ready
+            .iter()
+            .any(|effect| effect.kind().exempt_from_wind_down_fence()),
+        "an exempt effect is ready: {ready:?}"
+    );
+
+    let id = workflow_persistence_id(&run_scope());
+    let record = fx
+        .workflow_store
+        .load(&id)
+        .await
+        .expect("the workflow store loads")
+        .expect("the run has a workflow record");
+    fx.workflow_store
+        .delete(&id, record.revision)
+        .await
+        .expect("the workflow record is deleted");
+
+    fx.workflow_store.reset_loads();
+    fx.settle().await;
+    assert_eq!(fx.workflow_store.loads(), 1, "one load for the round");
+
+    let record = fx
+        .workflow_store
+        .load(&id)
+        .await
+        .expect("the workflow store loads")
+        .expect("the flush re-created the record");
+    for effect in &ready {
+        let row =
+            record
+                .state
+                .outbox_entry(&rakka_agent_workflow::substrate::OutboxMessageId::new(
+                    effect.dispatch_ticket_id().as_str(),
+                ));
+        assert_eq!(
+            row.is_some(),
+            effect.kind().exempt_from_wind_down_fence(),
+            "only an exempt effect's row is put back: {:?}",
+            effect.kind()
+        );
+    }
 }
 
 /// A worker dying after the promotion's durable `Started` leaves an

@@ -505,6 +505,61 @@ where
             Ok(())
         })
     }
+
+    /// Loads the run's workflow record once and schedules every effect
+    /// against it (issue #25), rather than one load per effect.
+    ///
+    /// Each schedule deduplicates on the ticket id, as [`Self::dispatch`]
+    /// does. A schedule that loses its compare-and-set — another writer, such
+    /// as the dispatcher marking an earlier row `Dispatching`, moved the
+    /// record after the batch loaded it — reloads and re-applies that effect,
+    /// at most three more times, and the batch carries on
+    /// against the reloaded record. Any other failure, or a conflict still
+    /// losing past the bound, ends the batch with the error `dispatch` would
+    /// return.
+    fn dispatch_all<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        effects: &'a [AgentEffect],
+        accepted: &'a mut (dyn FnMut(usize) + Send),
+    ) -> crate::effect::AgentEffectFuture<'a, ()> {
+        Box::pin(async move {
+            if effects.is_empty() {
+                return Ok(());
+            }
+            let mut inbox = AgentRunInbox::with_clock(
+                workflow_run_id(scope),
+                self.store.clone(),
+                self.clock.clone(),
+            );
+            inbox.recover().await.map_err(sink_error)?;
+
+            for (index, effect) in effects.iter().enumerate() {
+                let mut reapplications = 0;
+                loop {
+                    let command = ticket_outbox_command(effect, self.retry_backoff_ms)?;
+                    match inbox.inner_mut().schedule_outbox(command).await {
+                        Ok(_acceptance) => break,
+                        Err(error)
+                            if error.code() == "revision-conflict"
+                                && reapplications < INBOX_WRITE_REAPPLICATIONS =>
+                        {
+                            reapplications += 1;
+                            inbox.recover().await.map_err(sink_error)?;
+                        }
+                        Err(error) => {
+                            return Err(AgentEffectError::Sink {
+                                code: "outbox-schedule-failed".to_string(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+                accepted(index);
+            }
+            Ok(())
+        })
+    }
 }
 
 /// How many times one of the dispatcher's own inbox writes is re-read and

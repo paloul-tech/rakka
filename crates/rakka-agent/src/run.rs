@@ -10467,26 +10467,65 @@ where
             .loop_state()
             .map(AgentLoopState::ready_effects)
             .unwrap_or_default();
-        for effect in &ready {
-            if winding_down && !effect.kind().exempt_from_wind_down_fence() {
-                continue;
-            }
-            let record = effect.to_workflow_effect(&self.scope);
-            // The schedule segment ends after durable acceptance into the
-            // outbox, which is what specification 17.6 asks of the producer
-            // row — not after the transition that marked the effect ready,
-            // because `Ready` does not prove the sink write landed.
-            let timer = AgentSegmentTimer::start(now);
-            let dispatched = self.effects.dispatch(&self.scope, &record).await;
-            let segment = timer.close(AgentSegmentOperation::EffectSchedule {
-                effect_kind: effect.kind().as_label(),
-            });
-            self.close_segment(match &dispatched {
-                Ok(()) => segment.ok(),
-                Err(error) => segment.failed("rakka.agent.outbox", error.code()),
-            });
-            dispatched?;
+        let (records, kinds): (Vec<_>, Vec<_>) = ready
+            .iter()
+            .filter(|effect| !winding_down || effect.kind().exempt_from_wind_down_fence())
+            .map(|effect| {
+                (
+                    effect.to_workflow_effect(&self.scope),
+                    effect.kind().as_label(),
+                )
+            })
+            .unzip();
+        if records.is_empty() {
+            return Ok(dispatchable.len());
         }
+
+        // One call hands the round's effects over, so a sink that can accept
+        // them for one store read does (issue #25): the flush re-sends every
+        // ready effect on every round, and per-effect reads would multiply.
+        //
+        // Each effect's schedule segment still ends after its own durable
+        // acceptance into the outbox, which is what specification 17.6 asks
+        // of the producer row — not after the transition that marked the
+        // effect ready, because `Ready` does not prove the sink write landed.
+        // Every segment keeps the command's anchor; effect `i`'s duration
+        // runs from the previous acceptance, so the shared read is counted in
+        // the first effect's.
+        let mut closed = Vec::with_capacity(records.len());
+        let mut timer = AgentSegmentTimer::start(now);
+        let dispatched = {
+            let mut accepted = |index: usize| {
+                // An index reported out of order, twice, or past the end is a
+                // sink's bug and is ignored: each effect closes one segment.
+                if index != closed.len() || index >= kinds.len() {
+                    return;
+                }
+                let segment = std::mem::replace(&mut timer, AgentSegmentTimer::start(now)).close(
+                    AgentSegmentOperation::EffectSchedule {
+                        effect_kind: kinds[index],
+                    },
+                );
+                closed.push(segment.ok());
+            };
+            self.effects
+                .dispatch_all(&self.scope, &records, &mut accepted)
+                .await
+        };
+        if let Err(error) = &dispatched {
+            // The effect the sink failed on is the first one not accepted.
+            if let Some(&effect_kind) = kinds.get(closed.len()) {
+                closed.push(
+                    timer
+                        .close(AgentSegmentOperation::EffectSchedule { effect_kind })
+                        .failed("rakka.agent.outbox", error.code()),
+                );
+            }
+        }
+        for segment in closed {
+            self.close_segment(segment);
+        }
+        dispatched?;
 
         Ok(dispatchable.len())
     }
