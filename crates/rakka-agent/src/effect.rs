@@ -3014,6 +3014,33 @@ pub trait AgentRunEffectSink: Clone + Send + Sync + 'static {
         scope: &'a AgentRunScope,
         effect: &'a AgentEffect,
     ) -> AgentEffectFuture<'a, ()>;
+
+    /// Hands several effects to the outbox, in order, each idempotently on its
+    /// effect id, calling `accepted(i)` once effect `i` is durably accepted.
+    ///
+    /// Each index is reported once, in order. The first error ends the call
+    /// and is returned, and the effects after it are not handed over.
+    ///
+    /// The provided body hands the effects over one [`Self::dispatch`] at a
+    /// time. A sink that can accept several effects for one store read
+    /// overrides it, as the workflow outbox sink does: a run's flush hands
+    /// every unresolved effect over on every round, so per-effect reads
+    /// multiply (issue #25). A sink that wraps another should forward this
+    /// method to the inner sink, or it keeps the per-effect cost.
+    fn dispatch_all<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        effects: &'a [AgentEffect],
+        accepted: &'a mut (dyn FnMut(usize) + Send),
+    ) -> AgentEffectFuture<'a, ()> {
+        Box::pin(async move {
+            for (index, effect) in effects.iter().enumerate() {
+                self.dispatch(scope, effect).await?;
+                accepted(index);
+            }
+            Ok(())
+        })
+    }
 }
 
 /// An in-memory effect sink, for tests and single-process deployments.
