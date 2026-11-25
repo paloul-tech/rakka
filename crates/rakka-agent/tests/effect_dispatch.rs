@@ -2792,21 +2792,77 @@ async fn a_post_terminal_promotion_survives_the_wind_down_fence() {
     assert_eq!(after.terminal_at, before.terminal_at);
 }
 
-/// A worker dying after the promotion's durable `Started` leaves an
-/// ambiguous attempt on a run that has ended. The promotion is idempotent,
-/// so the recovered worker retries it under the same generation's key and
-/// converges on one memory at its initial revision; the terminal run opens
-/// no reconciliation checkpoint and its status does not move.
-/// Issue #25: an ended run's flush still hands its fence-exempt effects to
-/// the outbox through the one-load batch. A post-terminal promotion whose row
-/// was lost is put back in one load of the workflow record, and nothing the
-/// fence stopped is put back with it.
+/// Issue #25, review focus 1: a winding-down run's flush hands over only its
+/// fence-exempt effects, and in one load. The run has three tool effects and a
+/// memory promotion `Ready` when it is cancelled; after its workflow record is
+/// lost, one settle puts back the promotion's row in one load, and none of the
+/// tool rows the fence stopped.
 #[tokio::test]
-async fn a_lost_post_terminal_promotion_row_is_put_back_in_one_load() {
+async fn a_winding_down_run_puts_back_only_its_exempt_row_in_one_load() {
+    use rakka_agent::{
+        AgentOperationId, AgentOperationKind, AgentRunMemory, InMemoryAgentPrivateMemoryStore,
+        InMemoryContextSnapshotStore, InMemorySessionMemoryStore, SessionMemoryPromotionExecutor,
+    };
     use rakka_persistence::DurableStateStore as _;
-    let (fx, _private) = completed_promoting_fixture().await;
-    apply_to_run(&fx, post_terminal_promotion_command("post-1")).await;
+
+    let session = Arc::new(InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    let private = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    let call = |id: &str| {
+        AgentToolCallRequest::new(
+            AgentToolCallId::new(id).expect("call id should be valid"),
+            AgentToolId::new(TOOL).expect("tool id should be valid"),
+            serde_json::json!({ "amount": 42 }),
+        )
+        .expect("the tool call is bounded")
+    };
+    let three_calls = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_tool_call(call("call-1"))
+        .with_tool_call(call("call-2"))
+        .with_tool_call(call("call-3"));
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn(three_calls)
+            .with_turn(proposing_turn("resolved")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_promotions(
+        AgentRunMemory::new(session.clone(), snapshots).with_private_store(private.clone()),
+        Arc::new(SessionMemoryPromotionExecutor::new(session, private)),
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    apply_to_run(&fx, post_terminal_promotion_command("live-1")).await;
     fx.settle().await;
+    apply_to_run(
+        &fx,
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator stopped the work".to_string(),
+        },
+    )
+    .await;
+
+    let ready = loop_state(&fx).await.ready_effects();
+    assert!(
+        ready
+            .iter()
+            .any(|effect| !effect.kind().exempt_from_wind_down_fence()),
+        "a fenced effect is ready: {ready:?}"
+    );
+    assert!(
+        ready
+            .iter()
+            .any(|effect| effect.kind().exempt_from_wind_down_fence()),
+        "an exempt effect is ready: {ready:?}"
+    );
 
     let id = workflow_persistence_id(&run_scope());
     let record = fx
@@ -2822,10 +2878,8 @@ async fn a_lost_post_terminal_promotion_row_is_put_back_in_one_load() {
 
     fx.workflow_store.reset_loads();
     fx.settle().await;
-    assert_eq!(fx.workflow_store.loads(), 1, "one load puts the row back");
+    assert_eq!(fx.workflow_store.loads(), 1, "one load for the round");
 
-    let state = loop_state(&fx).await;
-    let ready: Vec<_> = state.ready_effects();
     let record = fx
         .workflow_store
         .load(&id)
@@ -2846,14 +2900,13 @@ async fn a_lost_post_terminal_promotion_row_is_put_back_in_one_load() {
             effect.kind()
         );
     }
-    assert!(
-        ready
-            .iter()
-            .any(|effect| effect.kind().exempt_from_wind_down_fence()),
-        "the promotion is ready"
-    );
 }
 
+/// A worker dying after the promotion's durable `Started` leaves an
+/// ambiguous attempt on a run that has ended. The promotion is idempotent,
+/// so the recovered worker retries it under the same generation's key and
+/// converges on one memory at its initial revision; the terminal run opens
+/// no reconciliation checkpoint and its status does not move.
 #[tokio::test]
 async fn an_ambiguous_post_terminal_promotion_retries_and_converges_without_a_checkpoint() {
     let (fx, private) = completed_promoting_fixture().await;

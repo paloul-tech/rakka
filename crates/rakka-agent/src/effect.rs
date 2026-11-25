@@ -3025,8 +3025,14 @@ pub trait AgentRunEffectSink: Clone + Send + Sync + 'static {
     /// time. A sink that can accept several effects for one store read
     /// overrides it, as the workflow outbox sink does: a run's flush hands
     /// every unresolved effect over on every round, so per-effect reads
-    /// multiply (issue #25). A sink that wraps another should forward this
-    /// method to the inner sink, or it keeps the per-effect cost.
+    /// multiply (issue #25).
+    ///
+    /// A sink that wraps another should override this method too, doing what
+    /// its own `dispatch` does for each effect (or once for the batch, where
+    /// that is enough) and then calling the inner sink's `dispatch_all`.
+    /// Left with this default, it keeps the inner sink's per-effect cost.
+    /// Forwarding straight to the inner `dispatch_all` would skip its own
+    /// work, because a run's flush calls only this method.
     fn dispatch_all<'a>(
         &'a self,
         scope: &'a AgentRunScope,

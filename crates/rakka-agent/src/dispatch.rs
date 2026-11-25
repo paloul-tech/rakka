@@ -513,7 +513,7 @@ where
     /// does. A schedule that loses its compare-and-set — another writer, such
     /// as the dispatcher marking an earlier row `Dispatching`, moved the
     /// record after the batch loaded it — reloads and re-applies that effect,
-    /// at most [`INBOX_WRITE_REAPPLICATIONS`] times, and the batch carries on
+    /// at most three more times, and the batch carries on
     /// against the reloaded record. Any other failure, or a conflict still
     /// losing past the bound, ends the batch with the error `dispatch` would
     /// return.
