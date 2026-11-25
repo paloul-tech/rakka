@@ -80,20 +80,22 @@ The M1 per-turn durable-write budget is pinned as exact assertions in
 (`per_turn_durable_write_count_and_latency_measurement`): one clean model
 turn — creation through accepted result and settled escrow — costs
 
-| Store | Compare-and-set writes |
-| --- | --- |
-| run store | 10 |
-| task store | 8 |
-| workflow outbox | 3 |
+| Store | Compare-and-set writes | Loads |
+| --- | --- | --- |
+| run store | 10 | not budgeted |
+| task store | 8 | not budgeted |
+| workflow outbox | 3 | 8 |
 
-The fleet store is deliberately unbudgeted: its lease bookkeeping scales
-with worker churn, not turns. Wall-clock latency is informational and never
+The workflow outbox's loads are budgeted because a run's effect flush re-reads
+the record on every settle round (issue #25): each load is a round trip on a
+real store. The fleet store is deliberately unbudgeted: its lease
+bookkeeping scales with worker churn, not turns. Wall-clock latency is informational and never
 asserted; measured on a release build over in-memory stores:
 
 ```text
 one full turn (accept -> model effect -> ticket -> claim -> invoke -> deliver
 -> propose -> accept): run-store writes = 10, task-store writes = 8,
-workflow-store writes = 3, wall time = ~2.0ms
+workflow-store writes = 3, workflow-store loads = 8, wall time = ~2.0ms
 ```
 
 Reproduce with:
@@ -105,6 +107,20 @@ cargo test -p rakka-agent --release --test effect_dispatch \
 
 A deliberate pipeline change that moves a count must re-derive the budget —
 update the test's constants and this table together.
+
+One clean turn has one ready effect at a time, so it cannot show what a
+flush round costs with several. That is measured on PostgreSQL by a gated
+test, which times three ready effects handed over effect by effect (three
+loads) against one batch (one load), with 0, 50 and 200 finished outbox rows
+of history:
+
+```sh
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo test -p rakka-agent --all-features --release --test effect_flush_postgres -- --nocapture
+```
+
+On PostgreSQL 17.5 a release build measured about 1.1-1.9 ms per round
+before and 0.4-0.7 ms after; wall time is informational and never asserted.
 
 ## Live provider walk (gated)
 

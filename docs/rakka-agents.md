@@ -586,7 +586,10 @@ invoked again until someone decides.
 A lost row gets that answer however it is reached. A run puts a missing row
 back whenever it settles: every command it handles and every settle pass
 sends its ready effects to the outbox again, as new rows with no attempt
-history, and the park is itself such a command. The fleet entry records
+history, and the park is itself such a command. A settle round hands all of
+its ready effects over in one call, and the workflow outbox sink loads the
+run's record once for them (issue #25), so the re-send costs one read per
+round, not one per effect. The fleet entry records
 which row it was registered from (`AgentDispatchEntry::row_scheduled_at`),
 so a claim that finds another row in its place parks the effect in the same
 way and finishes the row the run put back; when one run lost several rows

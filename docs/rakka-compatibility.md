@@ -1155,6 +1155,24 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** Nothing durable changes. An owner built against an earlier version keeps its second writer and its `Recover`, and works as before.
 
+- Issue #25: **a run's effect flush loads the workflow record once per round.** This is additive. No durable state, error code or segment count changes.
+
+  **Why.** A run's flush hands every `Ready`, unresolved effect to the outbox again on every settle round, because `Ready` does not prove the sink write landed. The workflow outbox sink loaded and decoded the run's whole workflow record once per effect, so a run with several effects out paid several round trips per round on a real store, each growing with the record's history.
+
+  **What is new** (`rakka-agent`):
+  - **`AgentRunEffectSink::dispatch_all`**, a provided method. It hands several effects over in order, calls `accepted(i)` once effect `i` is durably accepted, and stops at the first error. Its default calls `dispatch` for each effect, so an existing sink keeps compiling and behaves as before.
+  - **`WorkflowAgentRunEffectSink` overrides it** to load the record once per batch. A schedule that loses its compare-and-set reloads and re-applies that effect, at most three more times (the dispatcher's bound for its own writes, issue #81). Any other failure, or a conflict past the bound, ends the batch with `outbox-schedule-failed`, as `dispatch` does.
+  - **The run's flush** makes one `dispatch_all` call per round. What it hands over is unchanged: every `Ready`, unresolved effect; only the fence-exempt kinds on a winding-down or ended run; and nothing at all, with no call and no load, when there is nothing to hand over.
+  - **`rakka_agent::testkit::CrashingStateStore::loads` and `reset_loads`** count loads apart from writes. The per-turn budget now pins the workflow store's loads: 8 for one clean turn, which this change leaves as it was, since a clean turn has one ready effect at a time.
+
+  **Telemetry.** Each effect still closes one `EffectSchedule` segment after its own durable acceptance, anchored at the command's time like every run segment. Only durations change: effect `i`'s runs from effect `i - 1`'s acceptance, so the shared load is in the first effect's segment and the others are shorter. An index a sink reports out of order, twice or past the end is ignored, so each effect closes one segment.
+
+  **A wrapping sink should forward `dispatch_all`.** A sink that implements only `dispatch` and wraps another gets the default, and keeps one load of the inner sink per effect.
+
+  **Measured** (`crates/rakka-agent/tests/effect_flush_postgres.rs`, gated on `RAKKA_POSTGRES_TEST_DSN`; PostgreSQL 17.5, release build, three ready effects): one round's hand-off goes from 3 loads to 1, and from about 1.1-1.9 ms to 0.4-0.7 ms with 0 to 200 finished outbox rows of history.
+
+  **Mixed builds and rollback.** Nothing durable changes, so builds before and after read and write the same rows.
+
 Run the default compatibility matrix:
 
 ```sh
