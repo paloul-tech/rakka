@@ -1133,6 +1133,28 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
   - An earlier agent dispatcher reads a witnessed row as one counted attempt: it parks an idempotent call (#206) and tells other classes `Cancelled`, charged 1. It tells a reconcileable call with a failed attempt `Cancelled`, and its sweep does not settle fenced live rows.
   - Rolled back, witnessed rows stay, and an earlier build reads them as above.
 
+- Issue #71, item 1 ("three `AgentRunActorCommand` arms") is met another way: **an owner-held run core.** This is additive. **No arm, error code, snapshot phase, metric or durable record changes, and no schema version moves.**
+
+  **Why.** An owner that hosts `AgentRunActor` and must make a write the command enum has no arm for wrote beside the actor through a second `AgentRunInbox` and `AgentStepRunner` over the same two stores. Examples are dispatching the due outbox, completing a branch, and applying an effect callback through the bridge. It then had to send the actor `Recover` after every such write, or the actor's next write lost its compare-and-set. Three arms would not have retired that, since such an owner composes many more writes than three.
+
+  **What is new** (`rakka-agent-workflow`):
+  - **`AgentRunCore<RunStore, WorkflowStore, Clock>`.** It holds what the actor held: the step runner, the durable inbox and outbox, the graph runtime and an optional snapshot registry. It has the actor's six constructors.
+  - **One method per command:** `recover`, `snapshot`, `accept_command`, `start`, `start_graph`, `mark_graph_ready`, `start_graph_node`, `complete_graph_node`, `schedule_graph_node_effect`, `begin_step`, `succeed_step`, `fail_step`, `wait`, `resume`, `complete`, `fail_run`, `request_cancellation`, `cancel`, `begin_compensation`, `schedule_effect` and `due_effects`. Each records under the phase the actor's command always recorded under.
+  - **`parts_mut()`** returns `AgentRunParts`, the core's own runner and inbox borrowed together, plus the graph runtime, so an owner can compose upstream's transitions on the instances the core uses.
+  - **`refresh_if_stale()`**, now public.
+  - **On the actor:** `AgentRunActor::from_core(core)` and `AgentRunActor::core()`.
+
+  **The actor.** It now holds one core, and each command runs the core's method of the same name. Each core operation boxes its work, so awaiting one, from the actor or inline in an owner, holds a small future: the actor's tests need less debug stack than before. Its replies, its answers when a stale component cannot be recovered, its recovery when it starts and restarts, and what it records in the snapshot registry are unchanged. Its existing tests pass unmodified, and a test pins the phase each of the 21 operations records an error under. The actor and the core run the same code, so a test that compares the two can only catch a difference in how the actor calls the core. Upstream's sharded run entity, the A2A host and the clustered example are unaffected.
+
+  **The single-writer contract** for an owner that holds the core instead of an actor. The owner must already be a single writer of the run's stores, as a sharded entity whose mailbox orders every write is.
+  - **Recover first.** It calls `recover()` before the first operation and whenever it is re-created. A core never recovered refuses with `not-recovered`.
+  - **Refresh, then read, then write.** It starts a composed write with `refresh_if_stale()`, and computes the write from state read after that refresh, with no core operation between the read and the write: every core operation may refresh too, and a write computed from state read before a refresh can land over another writer's change.
+  - **A store error leaves the outcome unknown.** A write that fails with a store error other than a revision conflict may have committed, and marks nothing stale. The owner calls `recover()` before relying on the core's state again.
+  - **A loss leaves the component stale.** A composed write that loses its compare-and-set to another writer of the store leaves that component stale, and the core's next operation recovers it.
+  - **Not recorded.** A composed write is not recorded in the snapshot registry until the owner's next core operation.
+
+  **Mixed builds and rollback.** Nothing durable changes. An owner built against an earlier version keeps its second writer and its `Recover`, and works as before.
+
 Run the default compatibility matrix:
 
 ```sh
