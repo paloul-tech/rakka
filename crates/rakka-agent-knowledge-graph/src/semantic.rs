@@ -42,8 +42,9 @@ use crate::search::ClaimSearch;
 /// embedding one backend accepts is one every backend can hold.
 pub const CLAIM_EMBEDDING_MAX_DIMENSIONS: u32 = 16_000;
 
-/// Largest number of claims one page of
-/// `KnowledgeGraphStore::unembedded_claims` reads.
+/// Largest number of rows whose claim id this build reads that one page of
+/// `KnowledgeGraphStore::unembedded_claims` reads. A row whose claim id this
+/// build refuses is read past and does not count toward it.
 pub const CLAIM_EMBEDDING_PAGE_MAX_CLAIMS: usize = 64;
 
 /// The text a claim is embedded from: its subject, its predicate and its

@@ -180,8 +180,10 @@ impl PostgresKnowledgeGraphStore {
     }
 }
 
-/// Largest number of rows one [`PostgresKnowledgeGraphStore::index_claims`]
-/// page reads.
+/// Largest number of rows whose claim id this build reads that one
+/// [`PostgresKnowledgeGraphStore::index_claims`] page handles. A row whose
+/// claim id this build refuses is read past and does not count toward it,
+/// so a page can read more rows than this.
 pub const CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS: usize = 256;
 
 /// One bounded page of [`PostgresKnowledgeGraphStore::index_claims`]
@@ -250,10 +252,10 @@ impl PostgresKnowledgeGraphStore {
     /// space, feeding each page's [`ClaimSearchIndexPage::next`] back as
     /// `after`, until a page answers no cursor.
     ///
-    /// Each page reads at most `limit` rows (clamped to
-    /// `1..=`[`CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS`]) in claim-id order after
-    /// the cursor, derives each row's index from its record, and writes it
-    /// only where the row is still live and still unindexed
+    /// Each page handles at most `limit` rows whose claim id this build reads
+    /// (clamped to `1..=`[`CLAIM_SEARCH_INDEX_PAGE_MAX_ROWS`]) in claim-id
+    /// order after the cursor, derives each row's index from its record, and
+    /// writes it only where the row is still live and still unindexed
     /// ([`CLAIM_SEARCH_INDEX_WRITE_SQL`]). A record this build cannot decode
     /// is counted in [`ClaimSearchIndexPage::skipped`] and passed over; it
     /// does not stop the pass.

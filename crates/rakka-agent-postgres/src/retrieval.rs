@@ -51,6 +51,11 @@
 //! (`SET hnsw.iterative_scan = strict_order`). Until then, the exact scan is
 //! the correct-recall path and the default.
 //!
+//! The cast refuses a vector of any other dimension count (SQLSTATE `22000`)
+//! on every write, so such an index is dropped or rebuilt before the
+//! embedder's dimension count changes. Until it is, `index_memory` and
+//! `reindex` return pgvector's error.
+//!
 //! # Deriving, rebuilding, and retention
 //!
 //! Vectors are written by deployment-invoked maintenance, mirroring the
@@ -358,8 +363,8 @@ impl PgvectorPrivateMemoryRetriever {
     /// dimensions, more dimensions than the pgvector ceiling, version 0 (the
     /// table's `CHECK` starts versions at 1), a model holding a NUL (which a
     /// text column refuses), or a dimension count or version outside its
-    /// column. So a write refused for its values can only have been refused
-    /// for the memory's own ([`is_row_data_sqlstate`]).
+    /// column. So a refused character in the derived row's write is the
+    /// memory's own ([`is_row_data_refusal`]).
     fn embedder_identity(&self) -> Result<(MemoryEmbeddingRef, i32, i64), MemoryError> {
         let reference = self.embedder.embedding_ref();
         if reference.model.is_empty() || reference.dimensions == 0 {
@@ -501,9 +506,9 @@ impl PgvectorPrivateMemoryRetriever {
             )
             .await
             .map_err(|error| {
-                let refused = error
-                    .as_db_error()
-                    .is_some_and(|db_error| is_row_data_sqlstate(db_error.code().code()));
+                let refused = error.as_db_error().is_some_and(|db_error| {
+                    is_row_data_refusal(db_error.code().code(), db_error.constraint())
+                });
                 if refused {
                     StoreFailure::RowRefused(map_error(error))
                 } else {
@@ -641,12 +646,16 @@ impl PgvectorPrivateMemoryRetriever {
     /// already stored stays, and a retry of the same page reads what is
     /// still missing. A failed embedding is never an error.
     ///
-    /// Nor is a write the database refuses for one memory's own data
-    /// (SQLSTATE class 22 or 23, such as a NUL in its digest), or a memory
-    /// whose revision is outside the storable range: every retry would meet
-    /// the same refusal, so it is counted into [`ReindexPage::failed`] and
-    /// paged past (issue #199). [`Self::index_memory`] for that memory
-    /// returns the database's error.
+    /// Nor is a write the shipped schema refuses for one memory's own data
+    /// (a NUL or another character its digest's text column cannot hold, or
+    /// a failed check on its revision or confidence), or a memory whose
+    /// revision is outside the storable range: every retry would meet the
+    /// same refusal, so it is counted into [`ReindexPage::failed`] and paged
+    /// past (issue #199). [`Self::index_memory`] for that memory returns the
+    /// database's error. Any other refusal is returned, whatever its
+    /// SQLSTATE class, because it may refuse every write: a deployment's own
+    /// constraint or trigger, or the HNSW index below, which refuses an
+    /// embedder of another dimension count.
     pub async fn reindex(
         &self,
         scope: &AgentScope,
@@ -709,8 +718,8 @@ impl PgvectorPrivateMemoryRetriever {
                     failed += 1;
                     continue;
                 };
-                // A write the database refuses for the memory's own data is
-                // counted and paged past: every retry would meet the same
+                // A write the shipped schema refuses for the memory's own data
+                // is counted and paged past: every retry would meet the same
                 // refusal (issue #199). Any other failure ends the call.
                 match self
                     .store_vector(scope, &memory, &vector, &identity, now)
@@ -1047,25 +1056,41 @@ fn encode_vector(vector: &[f32]) -> Result<String, MemoryError> {
     Ok(encoded)
 }
 
-/// Whether a failed write was refused for the values it wrote: SQLSTATE
-/// class 22 (a data exception, such as a NUL in a text value) or 23 (an
-/// integrity constraint violation, such as a failed `CHECK`).
+/// The `CHECK` constraints of the derived table whose values come from the
+/// memory itself (its revision and its confidence), as PostgreSQL names the
+/// unnamed checks of [`VECTOR_MIGRATION_SQL`].
+const ROW_DATA_CHECKS: [&str; 2] = [
+    "rakka_agent_private_memory_embedding_source_revision_check",
+    "rakka_agent_private_memory_embedding_confidence_bps_check",
+];
+
+/// Whether a failed write of the derived row was refused for the memory's
+/// own data, by the shipped schema: a character a text column cannot hold
+/// (SQLSTATE `22021`, which is how PostgreSQL refuses a NUL, or `22P05`), or
+/// one of the [`ROW_DATA_CHECKS`] (`23514`, by constraint name). In this
+/// write the only free text taken from the memory is its digest:
+/// [`PgvectorPrivateMemoryRetriever::embedder_identity`] refuses a model the
+/// table cannot store, and the other text values are validated ids and fixed
+/// labels.
 ///
-/// [`PgvectorPrivateMemoryRetriever::embedder_identity`] refuses every
-/// identity the derived table cannot store, so in the derived row's write
-/// such an error can only come from the memory's own data. No other class is
-/// read that way: a lost connection, a missing table, a refused privilege, a
-/// serialization failure or a cancelled statement says nothing about the
-/// row (issue #199).
-fn is_row_data_sqlstate(code: &str) -> bool {
-    code.starts_with("22") || code.starts_with("23")
+/// Nothing else is read that way, whatever its class (issue #199). A
+/// deployment's own constraint, trigger or index can refuse every write: the
+/// HNSW expression index the module documentation offers refuses an embedder
+/// of another dimension count with `22000`. Counting such a refusal per
+/// memory would hide it behind a page of failures and a model call for each.
+fn is_row_data_refusal(code: &str, constraint: Option<&str>) -> bool {
+    match code {
+        "22021" | "22P05" => true,
+        "23514" => constraint.is_some_and(|name| ROW_DATA_CHECKS.contains(&name)),
+        _ => false,
+    }
 }
 
 /// Why [`PgvectorPrivateMemoryRetriever::store_vector`] stored nothing.
 #[derive(Debug)]
 enum StoreFailure {
-    /// The memory's own data was refused: a SQLSTATE class 22 or 23 error
-    /// from the write ([`is_row_data_sqlstate`]), or a revision outside the
+    /// The memory's own data was refused: the shipped schema refused the
+    /// write for it ([`is_row_data_refusal`]), or its revision is outside the
     /// storable range. Every write of this memory fails the same way, so a
     /// sweep counts it and pages past it.
     RowRefused(MemoryError),
@@ -2567,30 +2592,67 @@ mod tests {
     }
 
     #[test]
-    fn a_write_error_is_the_rows_own_data_only_in_sqlstate_classes_22_and_23() {
-        for code in [
-            "22000", "22003", "22021", "22P02", "23000", "23502", "23505", "23514", "23P01",
+    fn a_write_error_is_the_rows_own_data_only_for_the_shipped_schemas_codes() {
+        const SOURCE_REVISION: &str = "rakka_agent_private_memory_embedding_source_revision_check";
+        const CONFIDENCE: &str = "rakka_agent_private_memory_embedding_confidence_bps_check";
+        // What the shipped schema raises for a memory's own data: a NUL or a
+        // character the server encoding cannot hold in its digest, and the
+        // two CHECKs on values taken from the memory.
+        for (code, constraint) in [
+            ("22021", None),
+            ("22P05", None),
+            ("23514", Some(SOURCE_REVISION)),
+            ("23514", Some(CONFIDENCE)),
         ] {
-            assert!(is_row_data_sqlstate(code), "{code}");
+            assert!(
+                is_row_data_refusal(code, constraint),
+                "{code} {constraint:?}"
+            );
         }
-        for code in [
-            "", "2", "21000", "24000", "2F000", "08006", "40001", "42501", "42P01", "53100",
-            "57014", "XX000",
+        // Everything else, of any class: pgvector's dimension cast in a
+        // deployment's HNSW expression index (22000), a deployment's own
+        // CHECK, the CHECKs on the embedder's identity, and every class that
+        // says nothing about a row.
+        for (code, constraint) in [
+            ("22000", None),
+            ("22003", None),
+            ("22P02", None),
+            ("23514", None),
+            ("23514", Some("a_deployment_check")),
+            (
+                "23514",
+                Some("rakka_agent_private_memory_embedding_version_check"),
+            ),
+            ("23514", Some("rakka_agent_private_memory_embedding_check")),
+            ("23502", None),
+            ("23505", None),
+            ("", None),
+            ("21000", None),
+            ("24000", None),
+            ("08006", None),
+            ("40001", None),
+            ("42501", None),
+            ("57014", None),
+            ("XX000", None),
         ] {
-            assert!(!is_row_data_sqlstate(code), "{code}");
+            assert!(
+                !is_row_data_refusal(code, constraint),
+                "{code} {constraint:?}"
+            );
         }
     }
 
-    /// Raises `sqlstate` on every write of `memory_id`'s derived row in this
-    /// test's own tenant, through a function and a trigger named for the
-    /// tenant, so no other test's writes meet it. Answers the SQL that
-    /// removes both; run it before asserting, so a failed assertion leaves
-    /// nothing behind.
+    /// Raises `sqlstate`, naming `constraint` when one is given, on every
+    /// write of `memory_id`'s derived row in this test's own tenant, through
+    /// a function and a trigger named for the tenant, so no other test's
+    /// writes meet it. Answers the SQL that removes both; run it before
+    /// asserting, so a failed assertion leaves nothing behind.
     async fn raise_on_derived_write(
         retriever: &PgvectorPrivateMemoryRetriever,
         owner: &AgentScope,
         memory_id: &str,
         sqlstate: &str,
+        constraint: Option<&str>,
     ) -> String {
         // `unique()` makes the tenant `t<nanos>`: safe as an identifier and
         // as a literal.
@@ -2601,13 +2663,19 @@ mod tests {
             .batch_execute(&format!(
                 "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$
                  BEGIN
-                     RAISE EXCEPTION 'raised by a test' USING ERRCODE = TG_ARGV[0];
+                     IF TG_ARGV[1] = '' THEN
+                         RAISE EXCEPTION 'raised by a test' USING ERRCODE = TG_ARGV[0];
+                     ELSE
+                         RAISE EXCEPTION 'raised by a test'
+                             USING ERRCODE = TG_ARGV[0], CONSTRAINT = TG_ARGV[1];
+                     END IF;
                  END $$;
                  CREATE TRIGGER {name}
                      BEFORE INSERT OR UPDATE ON rakka_agent_private_memory_embedding
                      FOR EACH ROW
                      WHEN (NEW.tenant = '{tenant}' AND NEW.memory_id = '{memory_id}')
-                     EXECUTE FUNCTION {name}('{sqlstate}');"
+                     EXECUTE FUNCTION {name}('{sqlstate}', '{constraint}');",
+                constraint = constraint.unwrap_or("")
             ))
             .await
             .expect("install the raising trigger");
@@ -2618,24 +2686,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pgvector_reindex_counts_a_write_refused_for_its_data_and_returns_any_other_when_dsn_is_set(
-    ) {
-        // Issue #199: a write the database refuses for the row's own data
-        // (SQLSTATE class 22, a data exception, or 23, an integrity
-        // constraint violation) is counted and paged past. Every other write
-        // failure still ends the call, and what the call stored before it
-        // stays.
-        for (sqlstate, counted) in [
-            ("22021", true),
-            ("22003", true),
-            ("23514", true),
-            ("23505", true),
-            ("21000", false),
-            ("24000", false),
-            ("40001", false),
-            ("42501", false),
-            ("57014", false),
-            ("XX000", false),
+    async fn pgvector_reindex_counts_only_the_shipped_schemas_row_refusals_when_dsn_is_set() {
+        // Issue #199: a write the shipped schema refuses for the memory's own
+        // data is counted and paged past. Every other write failure still
+        // ends the call, whatever its class, and what the call stored before
+        // it stays: a deployment's own constraint or index can refuse every
+        // write, and counting that per memory would hide it.
+        const SOURCE_REVISION: &str = "rakka_agent_private_memory_embedding_source_revision_check";
+        let Some((_, retriever)) = vector_world().await else {
+            return;
+        };
+        let checks: Vec<String> = retriever
+            .client
+            .query(
+                "SELECT conname::text FROM pg_constraint \
+                 WHERE conrelid = 'rakka_agent_private_memory_embedding'::regclass \
+                   AND contype = 'c'",
+                &[],
+            )
+            .await
+            .expect("read the table's checks")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        for name in ROW_DATA_CHECKS {
+            assert!(
+                checks.iter().any(|check| check == name),
+                "{name} is a check of the migrated table: {checks:?}"
+            );
+        }
+        for (sqlstate, constraint, counted) in [
+            ("22021", None, true),
+            ("22P05", None, true),
+            ("23514", Some(SOURCE_REVISION), true),
+            ("22000", None, false),
+            ("22003", None, false),
+            ("23514", None, false),
+            ("23514", Some("a_deployment_check"), false),
+            ("23505", None, false),
+            ("21000", None, false),
+            ("24000", None, false),
+            ("40001", None, false),
+            ("42501", None, false),
+            ("57014", None, false),
+            ("XX000", None, false),
         ] {
             let Some((store, retriever)) = vector_world().await else {
                 return;
@@ -2647,7 +2741,8 @@ mod tests {
                 &[("a", EMBEDDABLE), ("b", EMBEDDABLE), ("c", EMBEDDABLE)],
             )
             .await;
-            let cleanup = raise_on_derived_write(&retriever, &owner, "mem-b", sqlstate).await;
+            let cleanup =
+                raise_on_derived_write(&retriever, &owner, "mem-b", sqlstate, constraint).await;
             let answer = retriever.reindex(&owner, None, now(300), 10).await;
             retriever
                 .client
@@ -2655,24 +2750,98 @@ mod tests {
                 .await
                 .expect("remove the raising trigger");
             if counted {
-                let answer = answer
-                    .unwrap_or_else(|error| panic!("{sqlstate}: counted, not returned: {error}"));
-                assert_eq!(counts(&answer), page(2, 0, 1, None), "{sqlstate}");
+                let answer = answer.unwrap_or_else(|error| {
+                    panic!("{sqlstate} {constraint:?}: counted, not returned: {error}")
+                });
+                assert_eq!(
+                    counts(&answer),
+                    page(2, 0, 1, None),
+                    "{sqlstate} {constraint:?}"
+                );
                 assert_eq!(
                     embedded(&retriever, &owner).await,
                     ["mem-a", "mem-c"],
-                    "{sqlstate}"
+                    "{sqlstate} {constraint:?}"
                 );
             } else {
-                let error = answer.map(|page| counts(&page)).expect_err(sqlstate);
-                assert_eq!(error.code(), "memory-backend-failed", "{sqlstate}");
+                let error = answer
+                    .map(|page| counts(&page))
+                    .expect_err("returned, not counted");
+                assert_eq!(
+                    error.code(),
+                    "memory-backend-failed",
+                    "{sqlstate} {constraint:?}"
+                );
                 assert_eq!(
                     embedded(&retriever, &owner).await,
                     ["mem-a"],
-                    "{sqlstate}: what was stored before stays, and nothing after it is tried"
+                    "{sqlstate} {constraint:?}: what was stored before stays, and nothing after it is tried"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_returns_a_dimension_cast_refused_by_a_deployments_hnsw_index_when_dsn_is_set(
+    ) {
+        // The approximate index the module documentation offers casts every
+        // vector to a fixed dimension count, and pgvector refuses an embedder
+        // of another count with SQLSTATE 22000, on every write. That says
+        // nothing about one memory, so the sweep returns it, after one model
+        // call, as before issue #199, instead of counting every memory after
+        // a model call each. The index is partial on this test's own tenant,
+        // so no other test's writes meet it.
+        let embedder = Arc::new(PickyEmbedder::refusing(None, Refusal::Errors));
+        let Some((store, retriever)) = vector_world_over(embedder.clone()).await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        seed(
+            &store,
+            &owner,
+            &[("a", EMBEDDABLE), ("b", EMBEDDABLE), ("c", EMBEDDABLE)],
+        )
+        .await;
+        let tenant = owner.tenant().as_str();
+        let index = format!("rakka_test_hnsw_{tenant}");
+        retriever
+            .client
+            .batch_execute(&format!(
+                "CREATE INDEX {index} ON rakka_agent_private_memory_embedding
+                     USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
+                     WHERE tenant = '{tenant}'"
+            ))
+            .await
+            .expect("create the deployment's index");
+        let answer = retriever.reindex(&owner, None, now(300), 10).await;
+        let single = retriever
+            .index_memory(
+                &owner,
+                &AgentPrivateMemoryId::new("mem-a").expect("id"),
+                now(300),
+            )
+            .await;
+        retriever
+            .client
+            .batch_execute(&format!("DROP INDEX {index}"))
+            .await
+            .expect("drop the deployment's index");
+
+        let error = answer
+            .map(|page| counts(&page))
+            .expect_err("a refusal of every write is returned, not counted");
+        assert_eq!(error.code(), "memory-backend-failed");
+        assert_eq!(
+            embedder.calls(),
+            2,
+            "one model call for the sweep, one for index_memory"
+        );
+        let error = single.expect_err("index_memory names the cause");
+        assert!(
+            error.to_string().contains("expected 1536 dimensions"),
+            "{error}"
+        );
+        assert!(embedded(&retriever, &owner).await.is_empty());
     }
 
     #[tokio::test]

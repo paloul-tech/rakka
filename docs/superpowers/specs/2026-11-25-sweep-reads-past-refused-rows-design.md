@@ -30,10 +30,12 @@ cannot hold it. Two kinds of row still do.
   returns the write error and the cursor stays, so every retry meets the
   same memory. It takes one assignment to a public field to make.
 - **Latent, found with #199.** `embedder_identity` lets through an embedder
-  version of 0 and a model name holding a NUL. Both fail the derived
-  table's write for every row (`CHECK (version > 0)`, `22021`), though the
-  `reindex` doc says an identity that cannot be stored is refused before the
-  page is read.
+  version of 0 and a model name holding a NUL. The first fails the derived
+  table's write for every row (`CHECK (version > 0)`). The second fails the
+  page read and every retrieval, because the model is a bound parameter of
+  both (`22021`). Yet the `reindex` doc says an identity that cannot be
+  stored is refused before the page is read. (Corrected after the review:
+  the first version of this record said both fail the write.)
 
 ## 2. Approaches
 
@@ -51,10 +53,12 @@ For #200, the owner chose 1:
 
 For #199, proposed and not overruled:
 
-1. **Count a write the database refuses for the row's data** (SQLSTATE
-   class 22 or 23) in `failed` and page past it, as #151 does for a refused
-   embedding. Tighten `embedder_identity` so such an error can only come
-   from the row.
+1. **Count a write the database refuses for the row's data** in `failed`
+   and page past it, as #151 does for a refused embedding. Tighten
+   `embedder_identity` so that the identity cannot cause such an error. The
+   first build counted SQLSTATE classes 22 and 23 whole; after the review the
+   owner narrowed it to the codes the shipped schema raises from a row's
+   own data (section 9).
 2. **Refuse the digest earlier,** in `AgentPrivateMemory::validate`.
    `validate` also runs when a record is decoded (`memory.rs:2211`), so a
    record already stored with such a digest would become unreadable on
@@ -74,16 +78,19 @@ For #199, proposed and not overruled:
   readable row handled, and `None` when the rows ran out. Each row is
   counted once per sweep.
 - **A write refused for the row's data.** An error from the derived row's
-  write whose SQLSTATE is in class 22 (data exception) or 23 (integrity
-  constraint violation) is counted in `failed` and paged past. So is a
+  write that the shipped schema raises for the memory's own data is counted
+  in `failed` and paged past: `22021` or `22P05` (a character a text column
+  cannot hold; the digest is the only free text taken from the memory), or
+  `23514` naming the `source_revision` or `confidence_bps` check. So is a
   record revision outside `BIGINT`, which the write already refuses in Rust
-  before any SQL. Every other write error still ends the call: a lost
+  before any SQL. Every other write error still ends the call, whatever its
+  class: a deployment's own constraint, trigger or index, a lost
   connection, a missing table, a refused privilege, a serialization failure
   or a lock timeout. What the call stored before it stays.
 - **The identity check.** `embedder_identity` also refuses a version of 0
   and a model holding a NUL, as `memory-embedding-invalid`. With the
   existing checks, every value a write takes from the identity is then one
-  the table stores, so a class 22 or 23 error can only come from the row.
+  the table stores.
 - **`index_memory` is unchanged** apart from the identity check: a write
   refused for one memory is still its error. It is how a caller learns why
   one memory fails.
@@ -106,6 +113,8 @@ For #199, proposed and not overruled:
 1. **Classes 22 and 23 whole**, not a list of codes. Both classes describe
    the values written. With the identity check tightened, every such value
    in this statement comes from the row, and neither class is transient.
+   **Overturned by the owner after the review** (section 9): a deployment's
+   own index or constraint also raises these classes, for every write.
 2. **The tightened identity check also reaches `retrieve`,** which shares
    it. An embedder at version 0 could never store a vector, so its
    retrievals answered nothing. They are now an error, as a dimension count
@@ -128,9 +137,10 @@ For #199, proposed and not overruled:
 |---|---|---|
 | A page of only refused ids (private) | `next = None`, the sweep ends early | Counted in `failed` and read past; the page ends on a readable id or at the end |
 | A refused claim id last in a full page (communal) | An error on this page and every retry | Counted and read past |
-| A private memory whose write the table refuses for its data | An error on this page and every retry | Counted in `failed` and paged past |
-| Any other write error | Ends the call | Unchanged |
-| An embedder at version 0, or with a NUL in its model | The first write fails; `retrieve` answers nothing | `memory-embedding-invalid` before the page is read or the model is called, from `reindex`, `index_memory` and `retrieve` |
+| A private memory whose write the shipped schema refuses for its data | An error on this page and every retry | Counted in `failed` and paged past |
+| Any other write error, whatever its class | Ends the call | Unchanged |
+| An embedder at version 0 | The first write fails; `retrieve` answers nothing | `memory-embedding-invalid` before the page is read or the model is called, from `reindex`, `index_memory` and `retrieve` |
+| An embedder with a NUL in its model | The page read and `retrieve` fail (`memory-backend-failed`) | The same `memory-embedding-invalid` |
 
 - One call may read more than `limit` rows, all of them beyond the first
   `limit` with refused ids. It makes no more model calls or writes than
@@ -154,11 +164,17 @@ id holding `|`.
   page. The memories on both sides are embedded, and a second sweep reads
   the refused memory again and nothing else.
 - The write-error boundary: a trigger scoped to the test's own tenant
-  raises a chosen SQLSTATE on the derived write. Codes in classes 22 and
-  23 are counted. Codes outside them (for example `40001`, `42501`,
-  `XX000`) end the call, and what was stored before stays. This replaces
-  the NUL digest as the #151 test's "a failed write ends the call". The
-  test drops its trigger when it ends.
+  raises a chosen SQLSTATE, and optionally a constraint name, on the
+  derived write. `22021`, `22P05` and `23514` on the `source_revision`
+  check are counted. Every other code ends the call, and what was stored
+  before stays: `22000`, `22003`, `23514` naming no or another constraint,
+  `23505`, and codes of other classes (`40001`, `42501`, `XX000`). This
+  replaces the NUL digest as the #151 test's "a failed write ends the
+  call". The test drops its trigger when it ends, and checks that the
+  constraint names it counts are those of the migrated table.
+- A deployment's HNSW expression index, partial on the test's tenant,
+  refuses an embedder of another dimension count with `22000`: the sweep
+  returns it after one model call, and `index_memory` names the cause.
 - The identity check: a version of 0 and a model holding a NUL are refused
   by `index_memory`, `reindex` and `retrieve` before the model is called.
 - Communal: for both passes, a refused claim id last in a full page, and a
@@ -179,3 +195,46 @@ The `retrieval.rs` module and `reindex` docs, and the comment in the loop;
   the owner.
 - **The in-memory retriever fails every retrieval on one refused memory**
   (#201), next in order, separately.
+
+## 9. The review
+
+A fresh reviewer read the whole branch and probed it against a database.
+It found the three passes' read-on loops correct (each read asks for the
+rows still owed, so a full page never reads a row after its cursor, and
+each refused row is counted once a sweep), and these faults:
+
+1. **Important, and a false premise of this record.** Section 4 call 1 held
+   that a class 22 or 23 error in the derived write could only come from
+   the row. The HNSW expression index the module documentation offers
+   casts every vector to a fixed dimension count, and pgvector refuses
+   another count with `22000`, on every write. A deployment's own `CHECK`
+   or trigger does the same. Under classes whole, a model switch that
+   changes the dimension count, which is what `reindex` is for, counted
+   every memory as failed after a paid model call each. On `main` it was
+   one error after one call. **The owner chose the exact codes** over
+   keeping the classes and correcting the docs. A row-data refusal that
+   nobody listed now holds the sweep, as on `main`, rather than being
+   counted. The module documentation now says to drop or rebuild such an
+   index before the dimension count changes.
+2. **Docs the branch made false** about how many rows a page reads (the
+   two page-size constants, `index_claims`, `unembedded_claims`). Each now
+   says it bounds rows whose id this build reads.
+3. **The "before" of a NUL model was wrong** here, in the compatibility
+   entry and in the changelog: it failed the page read and retrieval, not
+   the first write. Corrected in all three.
+
+Deferred, as minor, for the owner:
+
+- One `SELECT` for each refused row once a page is nearly full, because
+  each read asks for exactly the rows still owed: a run of N refused ids
+  at the end of a page costs N queries, each fetching that row's record.
+  Section 4 call 6's "each costs a parse" understates it. Reading `limit`
+  rows a round and stopping at the limit would bound it.
+- The communal loops' arithmetic is untested past a limit of 1: a mutant
+  that reads `limit` rows every round survives both communal tests.
+- The revision outside `BIGINT` mapping has no test.
+- `ReindexPage::failed` advises `index_memory` to learn why a memory
+  failed, which cannot name a row whose id this build refuses (wording
+  older than this branch).
+- Issue #151's compatibility row "A failed write | Unchanged" still
+  stands; the new entry replaces only #151's "Not changed" sentence.
