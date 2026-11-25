@@ -13,24 +13,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCommandKind, AgentCompiledExecutionPlan, AgentCompiledNodeId,
-    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
-    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
-    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId, AgentGraphEffectBridge,
-    AgentGraphEffectScheduleRequest, AgentGraphNodeStatus, AgentGraphRunProjection,
-    AgentGraphWaitReason, AgentPayloadDescriptor, AgentRunActor, AgentRunActorCommand,
-    AgentRunActorSnapshot, AgentRunCore, AgentRunEngineError, AgentRunId, AgentRunInbox,
-    AgentRunRuntimeError, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId,
-    AgentStepKind, AgentStepSuccess, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowId, AgentWorkflowSnapshotRegistry, InlineState, StateSchemaVersion,
-    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata,
+    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeTarget, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
+    AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffectId,
+    AgentGraphEffectBridge, AgentGraphEffectScheduleRequest, AgentGraphNodeStatus,
+    AgentGraphRunProjection, AgentGraphRunState, AgentGraphWaitReason, AgentPayloadDescriptor,
+    AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunCore, AgentRunEngineError,
+    AgentRunId, AgentRunInbox, AgentRunRuntimeError, AgentRunState, AgentRunStatus,
+    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess,
+    AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    AgentWorkflowSnapshotRegistry, ArtifactEncryptionRef, ArtifactKind, ArtifactRef, InlineState,
+    RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::{ActorRef, ActorSystem, InMemoryMetricsRecorder, Message, ReplyTo};
 use rakka_persistence::{
     DurableError, DurableStateStore, InMemoryDurableStateStore, PersistenceId, Revision,
     StateRecord, StoreFuture,
 };
-use rakka_workflow::{ManualWorkflowClock, OutboxMessageId, WorkflowState, WorkflowTimestamp};
+use rakka_workflow::{
+    ManualWorkflowClock, OutboxDispatchFuture, OutboxDispatchResult, OutboxDispatcher, OutboxEntry,
+    OutboxMessageId, WorkflowState, WorkflowTimestamp,
+};
 
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
 type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
@@ -795,4 +801,445 @@ fn node_status(graph: &AgentGraphRunProjection, node_id_value: &str) -> AgentGra
         .find(|node| node.node_id == node_id(node_id_value))
         .expect("the node is in the projection")
         .status
+}
+
+// ---------------------------------------------------------------------------
+// Composed writes on the core's own runner and inbox (Task 2).
+// ---------------------------------------------------------------------------
+
+/// An outbox dispatcher that answers success and counts what it dispatched.
+#[derive(Default)]
+struct CountingDispatcher {
+    dispatched: usize,
+}
+
+impl OutboxDispatcher for CountingDispatcher {
+    fn dispatch<'a>(&'a mut self, _entry: &'a OutboxEntry) -> OutboxDispatchFuture<'a> {
+        self.dispatched += 1;
+        Box::pin(async { OutboxDispatchResult::Success })
+    }
+}
+
+/// A recovered core driven to the `effect` node with its effect scheduled.
+async fn a_core_with_its_effect_scheduled(
+    fixture: &RuntimeFixture,
+    run_id: &AgentRunId,
+    registry: Option<AgentWorkflowSnapshotRegistry>,
+) -> (TestCore, AgentCompiledExecutionPlan, AgentEffectId) {
+    let plan = effect_graph_plan(&fixture.workflow);
+    let mut run_core = core(fixture, run_id.clone());
+    if let Some(registry) = registry {
+        run_core = run_core.with_snapshot_registry(registry);
+    }
+    run_core.recover().await.expect("recover");
+    run_core
+        .start_graph(
+            graph_accepted_run_state(&fixture.workflow, run_id),
+            &plan,
+            at(100),
+        )
+        .await
+        .expect("start graph");
+    run_core
+        .mark_graph_ready(&plan, at(110))
+        .await
+        .expect("ready");
+    run_core
+        .start_graph_node(&plan, node_id("input"), at(120))
+        .await
+        .expect("start input");
+    run_core
+        .complete_graph_node(&plan, node_id("input"), at(130))
+        .await
+        .expect("complete input");
+    run_core
+        .mark_graph_ready(&plan, at(140))
+        .await
+        .expect("ready");
+    run_core
+        .start_graph_node(&plan, node_id("effect"), at(150))
+        .await
+        .expect("start effect");
+    let scheduled = run_core
+        .schedule_graph_node_effect(&plan, effect_request(run_id.clone(), "effect", 160))
+        .await
+        .expect("schedule effect");
+    let effect_id = scheduled.effect_outcome.effect.effect_id.clone();
+    (run_core, plan, effect_id)
+}
+
+/// The graph state the runner holds.
+fn graph_of(runner: &AgentStepRunner<RunStore>) -> AgentGraphRunState {
+    runner
+        .state()
+        .expect("the runner reads")
+        .and_then(|state| state.graph_state.clone())
+        .expect("the run has graph state")
+}
+
+fn command_metadata(
+    workflow: &AgentWorkflow,
+    run_id: &AgentRunId,
+    command_id: &str,
+    received_at_millis: u64,
+) -> AgentCommandMetadata {
+    AgentCommandMetadata::new(
+        workflow.workflow_id.clone(),
+        run_id.clone(),
+        AgentCommandId::new(command_id),
+        AgentDurabilityMetadata::new(
+            AgentDeduplicationKey::new(format!("dedupe-{command_id}")),
+            AgentCausationId::new(format!("cause-{command_id}")),
+            AgentCorrelationId::new("correlation:workflow"),
+        ),
+        AgentTenantId::new("tenant-runtime"),
+        AgentTimestampMillis::new(received_at_millis),
+    )
+    .expect("the command metadata validates")
+}
+
+fn start_command(workflow: &AgentWorkflow, run_id: &AgentRunId, command_id: &str) -> AgentCommand {
+    AgentCommand::new(
+        AgentCommandKind::StartRun,
+        command_metadata(workflow, run_id, command_id, 100),
+    )
+    .expect("the start command validates")
+}
+
+fn artifact(artifact_id: &str) -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: artifact_id.to_string(),
+        kind: ArtifactKind::ToolOutput,
+        uri: format!("object://bucket/{artifact_id}"),
+        checksum: Some("sha256:abc".to_string()),
+        content_type: Some("application/json".to_string()),
+        byte_len: Some(128),
+        retention_class: Some("standard".to_string()),
+        encryption: Some(
+            ArtifactEncryptionRef::new("AES256-GCM", "kms://agent-workflow/test-key")
+                .context("tenant", "tenant-runtime"),
+        ),
+        redaction: RedactionStatus::ReferenceOnly,
+        created_at: AgentTimestampMillis::new(123),
+        metadata: BTreeMap::new(),
+    }
+}
+
+/// The host's composed writes need no recover. One core drives the effect
+/// graph to its scheduled effect; then, on the core's own runner and inbox,
+/// the owner dispatches the due outbox, accepts and applies the effect's
+/// completion through the bridge, and persists the graph; then the core
+/// completes the rest of the graph. No `recover` is called between any of
+/// these, and every write lands.
+#[tokio::test]
+async fn the_hosts_composed_writes_need_no_recover() {
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-composed");
+    let (mut run_core, plan, effect_id) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, None).await;
+    let mut dispatcher = CountingDispatcher::default();
+
+    let parts = run_core.parts_mut();
+    parts
+        .inbox
+        .inner_mut()
+        .dispatch_due_outbox(&mut dispatcher)
+        .await
+        .expect("the due outbox dispatches");
+    let graph = graph_of(parts.runner);
+    let command = parts
+        .graph_runtime
+        .effect_bridge()
+        .effect_completed_command(
+            command_metadata(&fixture.workflow, &run_id, "cmd-effect-completed", 200),
+            effect_id,
+            Some(artifact("artifact:effect-result")),
+        )
+        .expect("the completion command builds");
+    let outcome = parts
+        .graph_runtime
+        .effect_bridge()
+        .accept_and_apply_effect_completed(&plan, graph, command, parts.inbox)
+        .await
+        .expect("the completion applies");
+    parts
+        .runner
+        .update_graph_state(outcome.transition.state, at(200))
+        .await
+        .expect("the graph persists");
+
+    run_core
+        .mark_graph_ready(&plan, at(210))
+        .await
+        .expect("ready");
+    run_core
+        .start_graph_node(&plan, node_id("terminal"), at(220))
+        .await
+        .expect("start terminal");
+    run_core
+        .complete_graph_node(&plan, node_id("terminal"), at(230))
+        .await
+        .expect("complete terminal");
+
+    assert_eq!(dispatcher.dispatched, 1);
+    let snapshot = run_core.snapshot().await.expect("snapshot");
+    let graph = snapshot.graph.as_ref().expect("graph");
+    for node in ["input", "effect"] {
+        assert_eq!(
+            node_status(graph, node),
+            AgentGraphNodeStatus::Completed,
+            "{node}"
+        );
+    }
+    assert_eq!(
+        node_status(graph, "terminal"),
+        AgentGraphNodeStatus::Terminal
+    );
+    assert_eq!(snapshot.due_effect_count, 0);
+}
+
+/// The hazard the core removes: the same composed writes made through a
+/// second inbox and runner over the same stores, each recovered just before
+/// it writes as the host's second writer is, leave the core behind, and the
+/// core's next write loses its compare-and-set. This is what the host's
+/// `Recover` after every write exists for.
+#[tokio::test]
+async fn a_second_inbox_and_runner_lose_the_compare_and_set_the_core_does_not() {
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-second-writer");
+    let (mut run_core, plan, effect_id) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, None).await;
+    let mut dispatcher = CountingDispatcher::default();
+
+    let mut inbox = AgentRunInbox::with_clock(
+        run_id.clone(),
+        fixture.workflow_store.clone(),
+        fixture.clock.clone(),
+    );
+    inbox.recover().await.expect("the second inbox recovers");
+    let mut runner = AgentStepRunner::new(
+        fixture.workflow.clone(),
+        run_id.clone(),
+        fixture.run_store.clone(),
+    );
+    runner.recover().await.expect("the second runner recovers");
+    inbox
+        .inner_mut()
+        .dispatch_due_outbox(&mut dispatcher)
+        .await
+        .expect("the due outbox dispatches");
+    let bridge = AgentGraphEffectBridge::new();
+    let command = bridge
+        .effect_completed_command(
+            command_metadata(&fixture.workflow, &run_id, "cmd-effect-completed", 200),
+            effect_id,
+            Some(artifact("artifact:effect-result")),
+        )
+        .expect("the completion command builds");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, graph_of(&runner), command, &mut inbox)
+        .await
+        .expect("the completion applies");
+    runner
+        .update_graph_state(outcome.transition.state, at(200))
+        .await
+        .expect("the graph persists");
+
+    let lost = run_core
+        .mark_graph_ready(&plan, at(210))
+        .await
+        .expect_err("the core is behind the second runner");
+
+    assert!(is_revision_conflict(&lost), "{lost:?}");
+}
+
+/// `parts_mut` hands out the core's own components: a command accepted
+/// through it is in the core's inbox at once, with no recover.
+#[tokio::test]
+async fn parts_mut_hands_out_the_cores_own_components() {
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-own-parts");
+    let mut run_core = core(&fixture, run_id.clone());
+    run_core.recover().await.expect("recover");
+    let before = run_core
+        .inbox()
+        .inner()
+        .recoverable_inbox()
+        .expect("the inbox reads")
+        .len();
+
+    run_core
+        .parts_mut()
+        .inbox
+        .accept_command(start_command(&fixture.workflow, &run_id, "cmd-start"))
+        .await
+        .expect("the command is accepted");
+
+    let after = run_core
+        .inbox()
+        .inner()
+        .recoverable_inbox()
+        .expect("the inbox reads")
+        .len();
+    assert_eq!(after, before + 1);
+    assert_eq!(
+        run_core
+            .snapshot()
+            .await
+            .expect("snapshot")
+            .recoverable_command_count,
+        after
+    );
+}
+
+/// A composed write lost to another writer is refreshed by the next core
+/// operation, on either store. Another writer moves the workflow store, or
+/// the run store; the core's composed write on that component loses its
+/// compare-and-set and leaves the component stale; the core's next
+/// operation recovers it and runs against durable state.
+#[tokio::test]
+async fn a_composed_write_lost_to_another_writer_is_refreshed_by_the_next_operation() {
+    // (a) The workflow store.
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-lost-inbox-write");
+    let (mut run_core, _plan, _effect) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, None).await;
+    let mut other = AgentRunInbox::with_clock(
+        run_id.clone(),
+        fixture.workflow_store.clone(),
+        fixture.clock.clone(),
+    );
+    other.recover().await.expect("the other inbox recovers");
+    other
+        .accept_command(start_command(&fixture.workflow, &run_id, "cmd-other"))
+        .await
+        .expect("the other writer accepts");
+
+    run_core
+        .parts_mut()
+        .inbox
+        .accept_command(start_command(&fixture.workflow, &run_id, "cmd-mine"))
+        .await
+        .expect_err("the core's composed write loses");
+    assert!(run_core.inbox().is_stale());
+
+    let due = run_core
+        .due_effects()
+        .await
+        .expect("the next operation runs");
+    assert_eq!(due.len(), 1);
+    assert!(!run_core.inbox().is_stale());
+
+    // (b) The run store.
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-lost-runner-write");
+    let (mut run_core, _plan, _effect) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, None).await;
+    let mut runner = AgentStepRunner::new(
+        fixture.workflow.clone(),
+        run_id.clone(),
+        fixture.run_store.clone(),
+    );
+    runner.recover().await.expect("the other runner recovers");
+    let theirs = runner
+        .update_graph_state(graph_of(&runner), at(300))
+        .await
+        .expect("the other writer persists");
+
+    let graph = graph_of(run_core.runner());
+    run_core
+        .parts_mut()
+        .runner
+        .update_graph_state(graph, at(301))
+        .await
+        .expect_err("the core's composed write loses");
+    assert!(run_core.runner().is_stale());
+
+    let snapshot = run_core.snapshot().await.expect("the next operation runs");
+    assert_eq!(snapshot.run_state, Some(theirs.state));
+    assert!(!run_core.runner().is_stale());
+}
+
+/// `refresh_if_stale` recovers only a stale core. A core that has lost
+/// nothing does not re-read: another writer's change stays unseen. Once a
+/// composed write has lost its compare-and-set, the refresh re-reads.
+#[tokio::test]
+async fn refresh_if_stale_recovers_only_a_stale_core() {
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-refresh");
+    let (mut run_core, _plan, _effect) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, None).await;
+    let mut runner = AgentStepRunner::new(
+        fixture.workflow.clone(),
+        run_id.clone(),
+        fixture.run_store.clone(),
+    );
+    runner.recover().await.expect("the other runner recovers");
+    let theirs = runner
+        .update_graph_state(graph_of(&runner), at(300))
+        .await
+        .expect("the other writer persists");
+    let mine = run_core
+        .runner()
+        .state()
+        .expect("the runner reads")
+        .cloned();
+
+    run_core
+        .refresh_if_stale()
+        .await
+        .expect("a fresh core refreshes");
+    assert_eq!(
+        run_core.runner().state().expect("reads").cloned(),
+        mine,
+        "a core that lost nothing does not re-read"
+    );
+
+    let graph = graph_of(run_core.runner());
+    run_core
+        .parts_mut()
+        .runner
+        .update_graph_state(graph, at(301))
+        .await
+        .expect_err("the composed write loses");
+    run_core
+        .refresh_if_stale()
+        .await
+        .expect("a stale core refreshes");
+    assert!(!run_core.runner().is_stale());
+    assert_eq!(
+        run_core.runner().state().expect("reads").cloned(),
+        Some(theirs.state)
+    );
+}
+
+/// A composed write is recorded by the next core operation. Dispatching the
+/// due outbox through `parts_mut` changes nothing in the snapshot registry;
+/// the owner's next core operation records the run as it then stands.
+#[tokio::test]
+async fn a_composed_write_is_recorded_by_the_next_core_operation() {
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-recorded-later");
+    let registry = AgentWorkflowSnapshotRegistry::new();
+    let (mut run_core, _plan, _effect) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, Some(registry.clone())).await;
+    assert_eq!(registry.outbox_snapshot().due_effect_count(), 1);
+    let mut dispatcher = CountingDispatcher::default();
+
+    run_core
+        .parts_mut()
+        .inbox
+        .inner_mut()
+        .dispatch_due_outbox(&mut dispatcher)
+        .await
+        .expect("the due outbox dispatches");
+
+    assert_eq!(dispatcher.dispatched, 1);
+    assert_eq!(
+        registry.outbox_snapshot().due_effect_count(),
+        1,
+        "a composed write is not recorded"
+    );
+    run_core.snapshot().await.expect("snapshot");
+    assert_eq!(registry.outbox_snapshot().due_effect_count(), 0);
 }

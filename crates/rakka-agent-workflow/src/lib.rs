@@ -275,7 +275,7 @@ pub use retention::{
     AgentRetentionArchiveKind, AgentRetentionArchiveReason, AgentRetentionArchiveRecord,
     AgentRetentionCompactionReport, AgentRetentionPolicy, AgentRunStateCompaction,
 };
-pub use run_core::AgentRunCore;
+pub use run_core::{AgentRunCore, AgentRunParts};
 pub use runner::{
     agent_run_persistence_id, AgentRunEngineError, AgentRunEngineResult, AgentRunTransition,
     AgentRunTransitionKind, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
@@ -426,9 +426,9 @@ pub mod prelude {
         AgentRetentionCompactionReport, AgentRetentionPolicy, AgentRunActor, AgentRunActorCommand,
         AgentRunActorSnapshot, AgentRunCore, AgentRunEngineError, AgentRunEngineResult,
         AgentRunHumanCheckpointSnapshot, AgentRunId, AgentRunInbox, AgentRunIndexEntry,
-        AgentRunQueryWaitingReason, AgentRunRuntimeError, AgentRunRuntimeResult, AgentRunState,
-        AgentRunStateCompaction, AgentRunStatus, AgentRunTransition, AgentRunTransitionKind,
-        AgentRunWaitReason, AgentRuntimeEvent, AgentRuntimeEventAcceptance,
+        AgentRunParts, AgentRunQueryWaitingReason, AgentRunRuntimeError, AgentRunRuntimeResult,
+        AgentRunState, AgentRunStateCompaction, AgentRunStatus, AgentRunTransition,
+        AgentRunTransitionKind, AgentRunWaitReason, AgentRuntimeEvent, AgentRuntimeEventAcceptance,
         AgentRuntimeEventCorrelationFields, AgentRuntimeEventDraft, AgentRuntimeEventError,
         AgentRuntimeEventKind, AgentRuntimeEventProjection, AgentRuntimeEventResult,
         AgentRuntimeEventSink, AgentRuntimeEventSinkFuture, AgentRuntimeEventWriteStatus,

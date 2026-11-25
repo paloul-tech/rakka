@@ -39,6 +39,27 @@ use crate::{
     AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
 };
 
+/// The core's own runner and inbox, borrowed together, for a write its owner
+/// composes from upstream's transitions ([`AgentRunCore::parts_mut`] has the
+/// contract).
+///
+/// The split borrow lets one write use both: the effect bridge's
+/// `accept_and_apply_*` on [`Self::inbox`], then
+/// [`AgentStepRunner::update_graph_state`] on [`Self::runner`].
+pub struct AgentRunParts<'a, RunStore, WorkflowStore, Clock>
+where
+    RunStore: DurableStateStore<AgentRunState>,
+    WorkflowStore: DurableStateStore<WorkflowState>,
+    Clock: WorkflowClock,
+{
+    /// The core's durable run state machine.
+    pub runner: &'a mut AgentStepRunner<RunStore>,
+    /// The core's durable inbox and outbox.
+    pub inbox: &'a mut AgentRunInbox<WorkflowStore, Clock>,
+    /// The compiled graph runtime: its scheduler and effect bridge.
+    pub graph_runtime: AgentGraphRuntime,
+}
+
 /// The owner-held core of one durable agent run (see the [module
 /// documentation](self)).
 pub struct AgentRunCore<RunStore, WorkflowStore, Clock = SystemWorkflowClock>
@@ -172,11 +193,52 @@ where
         self.graph_runtime
     }
 
-    /// Recovers every component when one of them lost a compare-and-set, so
-    /// the next write runs against durable state.
+    /// The core's own runner and inbox, for an owner that composes upstream's
+    /// transitions on them ([`AgentRunParts`]).
     ///
-    /// Its recovery is [`Self::recover`]'s, recorded under `recover`.
-    async fn refresh_if_stale(&mut self) -> AgentRunRuntimeResult<()> {
+    /// These are the instances the core's operations use, not copies, so a
+    /// write made through them moves the revision the core holds, and the
+    /// core's next operation does not lose its compare-and-set to it. That is
+    /// what lets an owner that is already a single writer drive a run without
+    /// a second inbox and runner over the same stores.
+    ///
+    /// The contract for a composed write:
+    ///
+    /// - **Refresh first.** Call [`Self::refresh_if_stale`] before it.
+    /// - **Read after the refresh.** Compute the write from state read after
+    ///   that refresh, never from a copy read before it. The refresh replaces
+    ///   a stale copy with the stored one, and a write computed from the
+    ///   stale copy would then land over another writer's change that its
+    ///   compare-and-set would otherwise have refused.
+    /// - **A loss leaves the component stale.** A composed write that loses
+    ///   its compare-and-set to another writer of the store leaves that
+    ///   component stale. The core's next operation, or the next
+    ///   [`Self::refresh_if_stale`], recovers it.
+    /// - **Not recorded.** A composed write is the owner's operation, not the
+    ///   core's, and is not recorded in the snapshot registry. The owner's
+    ///   next core operation, or [`Self::snapshot`], records the run as it
+    ///   then stands.
+    pub fn parts_mut(&mut self) -> AgentRunParts<'_, RunStore, WorkflowStore, Clock> {
+        AgentRunParts {
+            runner: &mut self.runner,
+            inbox: &mut self.inbox,
+            graph_runtime: self.graph_runtime,
+        }
+    }
+
+    /// Recovers every component when one of them lost a compare-and-set, so
+    /// the next write runs against durable state. A core that lost nothing
+    /// reads nothing.
+    ///
+    /// Every core operation but [`Self::recover`] starts with it. An owner
+    /// calls it before a composed write ([`Self::parts_mut`]). Its recovery is
+    /// [`Self::recover`]'s, recorded under `recover`.
+    ///
+    /// # Errors
+    ///
+    /// The recovery failing; the component stays stale, and the next call
+    /// tries again.
+    pub async fn refresh_if_stale(&mut self) -> AgentRunRuntimeResult<()> {
         if self.runner.is_stale() || self.inbox.is_stale() {
             self.recover().await.map(|_snapshot| ())
         } else {
