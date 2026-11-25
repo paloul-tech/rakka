@@ -2797,6 +2797,63 @@ async fn a_post_terminal_promotion_survives_the_wind_down_fence() {
 /// so the recovered worker retries it under the same generation's key and
 /// converges on one memory at its initial revision; the terminal run opens
 /// no reconciliation checkpoint and its status does not move.
+/// Issue #25: an ended run's flush still hands its fence-exempt effects to
+/// the outbox through the one-load batch. A post-terminal promotion whose row
+/// was lost is put back in one load of the workflow record, and nothing the
+/// fence stopped is put back with it.
+#[tokio::test]
+async fn a_lost_post_terminal_promotion_row_is_put_back_in_one_load() {
+    use rakka_persistence::DurableStateStore as _;
+    let (fx, _private) = completed_promoting_fixture().await;
+    apply_to_run(&fx, post_terminal_promotion_command("post-1")).await;
+    fx.settle().await;
+
+    let id = workflow_persistence_id(&run_scope());
+    let record = fx
+        .workflow_store
+        .load(&id)
+        .await
+        .expect("the workflow store loads")
+        .expect("the run has a workflow record");
+    fx.workflow_store
+        .delete(&id, record.revision)
+        .await
+        .expect("the workflow record is deleted");
+
+    fx.workflow_store.reset_loads();
+    fx.settle().await;
+    assert_eq!(fx.workflow_store.loads(), 1, "one load puts the row back");
+
+    let state = loop_state(&fx).await;
+    let ready: Vec<_> = state.ready_effects();
+    let record = fx
+        .workflow_store
+        .load(&id)
+        .await
+        .expect("the workflow store loads")
+        .expect("the flush re-created the record");
+    for effect in &ready {
+        let row =
+            record
+                .state
+                .outbox_entry(&rakka_agent_workflow::substrate::OutboxMessageId::new(
+                    effect.dispatch_ticket_id().as_str(),
+                ));
+        assert_eq!(
+            row.is_some(),
+            effect.kind().exempt_from_wind_down_fence(),
+            "only an exempt effect's row is put back: {:?}",
+            effect.kind()
+        );
+    }
+    assert!(
+        ready
+            .iter()
+            .any(|effect| effect.kind().exempt_from_wind_down_fence()),
+        "the promotion is ready"
+    );
+}
+
 #[tokio::test]
 async fn an_ambiguous_post_terminal_promotion_retries_and_converges_without_a_checkpoint() {
     let (fx, private) = completed_promoting_fixture().await;
