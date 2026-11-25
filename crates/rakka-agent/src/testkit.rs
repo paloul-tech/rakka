@@ -3886,14 +3886,17 @@ where
 /// Every store class in the M1 suite — run, task, agent, workflow outbox, and
 /// dispatcher fleet — is wrapped in one of these, and [`sweep_crash_points`]
 /// drives the kill through every write of a flow. Compare-and-set and delete
-/// both count as writes, so the sweep stays exhaustive for flows that delete;
-/// loads are never counted and never crash.
+/// both count as writes, so the sweep stays exhaustive for flows that delete.
+/// Loads never crash, and are counted apart from writes
+/// ([`CrashingStateStore::loads`]): a load is a round trip on a real store.
 pub struct CrashingStateStore<S>
 where
     S: rakka_persistence::DurableState,
 {
     inner: rakka_persistence::InMemoryDurableStateStore<S>,
     writes: Arc<AtomicUsize>,
+    /// How many loads have been asked for since the last reset.
+    loads: Arc<AtomicUsize>,
     crash_at: Arc<AtomicUsize>,
     crash_after: Arc<std::sync::atomic::AtomicBool>,
     conflict: Arc<std::sync::atomic::AtomicBool>,
@@ -3918,6 +3921,7 @@ where
         Self {
             inner: self.inner.clone(),
             writes: self.writes.clone(),
+            loads: self.loads.clone(),
             crash_at: self.crash_at.clone(),
             crash_after: self.crash_after.clone(),
             conflict: self.conflict.clone(),
@@ -3958,6 +3962,7 @@ where
         Self {
             inner: rakka_persistence::InMemoryDurableStateStore::new(),
             writes: Arc::new(AtomicUsize::new(0)),
+            loads: Arc::new(AtomicUsize::new(0)),
             crash_at: Arc::new(AtomicUsize::new(0)),
             crash_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             conflict: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4034,6 +4039,20 @@ where
         self.writes.store(0, Ordering::SeqCst);
     }
 
+    /// How many loads have been asked for since the counter was last reset.
+    ///
+    /// Every load counts, whatever it answers, so a reader that finds no
+    /// record has still paid its round trip.
+    #[must_use]
+    pub fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+
+    /// Resets the load counter.
+    pub fn reset_loads(&self) {
+        self.loads.store(0, Ordering::SeqCst);
+    }
+
     /// Asserts the crash armed at the `nth` write was actually reached.
     ///
     /// A sweep iteration whose flow never attempts its armed write converges
@@ -4065,6 +4084,7 @@ where
         persistence_id: &'a rakka_persistence::PersistenceId,
     ) -> rakka_persistence::StoreFuture<'a, Option<rakka_persistence::StateRecord<S>>> {
         Box::pin(async move {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             let hook = self
                 .before_load
                 .lock()

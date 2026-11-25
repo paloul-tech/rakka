@@ -2110,6 +2110,11 @@ const TURN_BUDGET_TASK_STORE_WRITES: usize = 8;
 /// The workflow outbox's share: register the ticket, mark it dispatching,
 /// settle it.
 const TURN_BUDGET_WORKFLOW_STORE_WRITES: usize = 3;
+/// How many times one clean turn loads the run's workflow record: every
+/// reader counts, the run's effect flush and the dispatcher's passes alike
+/// (issue #25). A load is a round trip on a real store, and the flush re-reads
+/// on every settle, so it is budgeted like the writes are.
+const TURN_BUDGET_WORKFLOW_STORE_LOADS: usize = 8;
 
 #[tokio::test]
 async fn per_turn_durable_write_count_and_latency_measurement() {
@@ -2129,6 +2134,7 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     fx.fx.runs.reset_writes();
     fx.fx.tasks.reset_writes();
     fx.workflow_store.reset_writes();
+    fx.workflow_store.reset_loads();
 
     let started = std::time::Instant::now();
     fx.fx.create_task().await;
@@ -2144,10 +2150,12 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     let run_writes = fx.fx.runs.writes();
     let task_writes = fx.fx.tasks.writes();
     let workflow_writes = fx.workflow_store.writes();
+    let workflow_loads = fx.workflow_store.loads();
     println!(
         "one full turn (accept -> model effect -> ticket -> claim -> invoke -> deliver -> \
          propose -> accept): run-store writes = {run_writes}, task-store writes = \
-         {task_writes}, workflow-store writes = {workflow_writes}, wall time = {elapsed:?}"
+         {task_writes}, workflow-store writes = {workflow_writes}, workflow-store loads = \
+         {workflow_loads}, wall time = {elapsed:?}"
     );
 
     assert_eq!(
@@ -2163,6 +2171,11 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     assert_eq!(
         workflow_writes, TURN_BUDGET_WORKFLOW_STORE_WRITES,
         "the per-turn workflow-store budget moved; a deliberate pipeline change must \
+         re-derive the budget constant and the example README together"
+    );
+    assert_eq!(
+        workflow_loads, TURN_BUDGET_WORKFLOW_STORE_LOADS,
+        "the per-turn workflow-store load budget moved; a deliberate pipeline change must \
          re-derive the budget constant and the example README together"
     );
 }
