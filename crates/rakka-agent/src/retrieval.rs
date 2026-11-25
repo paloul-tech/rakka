@@ -1499,8 +1499,9 @@ mod tests {
         MemoryEntryId, MemoryOperationId, MemoryTombstoneReason, PrivateMemoryExpectation,
         PrivateMemoryTombstoneRequest, SessionMemoryEntry, SnapshotSessionEntry,
     };
-    use crate::testkit::{DeterministicEmbedder, ScriptedPrivateMemoryRetriever};
-    use tracing::instrument::WithSubscriber;
+    use crate::testkit::{
+        CapturingSubscriber, DeterministicEmbedder, ScriptedPrivateMemoryRetriever,
+    };
 
     fn run_scope() -> AgentRunScope {
         AgentRunScope::new(
@@ -1924,71 +1925,41 @@ mod tests {
         }
     }
 
-    /// One captured event: its fields as (name, rendered value), the message
-    /// included as `message`.
-    type CapturedEvent = Vec<(String, String)>;
-
-    /// A `tracing` subscriber that records every event it is given, so a test
-    /// can read what a retrieval logged.
-    #[derive(Clone, Default)]
-    struct CapturedEvents(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
-
-    impl CapturedEvents {
-        fn events(&self) -> Vec<CapturedEvent> {
-            self.0
-                .lock()
-                .expect("the capture lock is never poisoned")
-                .clone()
-        }
+    /// An agent scope under a tenant no other test uses, so the process-wide
+    /// log capture can be read for one test's lines alone.
+    fn unique_agent_scope(tenant: &str) -> AgentScope {
+        AgentScope::new(
+            TenantId::new(tenant),
+            AgentId::new("support").expect("agent id"),
+        )
+        .expect("agent scope")
     }
 
-    /// Renders an event's fields into a [`CapturedEvent`].
-    struct FieldRecorder<'a>(&'a mut CapturedEvent);
-
-    impl tracing::field::Visit for FieldRecorder<'_> {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0.push((field.name().to_string(), value.to_string()));
-        }
-
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
-            self.0
-                .push((field.name().to_string(), format!("{value:?}")));
-        }
+    /// The lines the process-wide capture holds for one tenant.
+    ///
+    /// The capture is the testkit's global one, not a subscriber scoped to the
+    /// test: while a scoped subscriber exists, a test thread with none of its
+    /// own that reaches the warning first marks it never-enabled for the whole
+    /// process, and the scoped test's line is dropped (found by the review of
+    /// issue #201 and reproduced with a probe). A global default is what such
+    /// a thread falls back to, so the warning stays enabled.
+    fn logged_for(logs: &CapturingSubscriber, tenant: &str) -> Vec<String> {
+        let needle = format!("tenant={tenant:?}");
+        logs.events()
+            .into_iter()
+            .filter(|line| line.contains(&needle))
+            .collect()
     }
 
-    impl tracing::Subscriber for CapturedEvents {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut fields = CapturedEvent::new();
-            event.record(&mut FieldRecorder(&mut fields));
-            self.0
-                .lock()
-                .expect("the capture lock is never poisoned")
-                .push(fields);
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// The value of one field of a captured event.
-    fn field<'a>(event: &'a CapturedEvent, name: &str) -> Option<&'a str> {
-        event
-            .iter()
-            .find(|(field, _)| field == name)
-            .map(|(_, value)| value.as_str())
+    /// The whole line a retrieval that left memories out logs, as the capture
+    /// renders it: the fixed message and exactly these five fields.
+    fn skip_warning(tenant: &str, skipped: usize, code: &str) -> String {
+        format!(
+            "rakka_agent::retrieval|WARN|the in-memory retriever left out memories its embedder \
+             refused; they are not ranked while the embedder refuses them|tenant={tenant:?},\
+             agent=\"support\",skipped={skipped},code={code:?},embedder={:?}",
+            DeterministicEmbedder::MODEL
+        )
     }
 
     /// The query of the issue's table that the refused memory answers best.
@@ -2141,7 +2112,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_embedder_refusing_every_memory_answers_empty_and_warns_once() {
-        let scope = run_scope().agent_scope();
+        const TENANT: &str = "t-issue-201-every-memory-refused";
+        let logs = CapturingSubscriber::install_global();
+        let scope = unique_agent_scope(TENANT);
         let memories = [("refused", REFUSED_TEXT), ("healthy", HEALTHY_TEXT)];
         let embedder = || {
             RefusingEmbedder::new()
@@ -2150,16 +2123,17 @@ mod tests {
         };
         let retriever = InMemoryPrivateMemoryRetriever::new(seeded_store(&scope, &memories).await)
             .with_embedder(Arc::new(embedder()));
-        let captured = CapturedEvents::default();
         let outcome = retriever
             .retrieve(&scope, &MemoryRetrievalQuery::new("renewal"), now())
-            .with_subscriber(captured.clone())
             .await
             .expect("an embedder that fails after the query is not an error");
         assert!(outcome.memories.is_empty());
-        let events = captured.events();
-        assert_eq!(events.len(), 1, "one warning for the retrieval: {events:?}");
-        assert_eq!(field(&events[0], "skipped"), Some("2"));
+        // Here the first error skipped quotes the memory's text; the line
+        // must still be exactly the fixed message and the five fields.
+        assert_eq!(
+            logged_for(&logs, TENANT),
+            [skip_warning(TENANT, 2, "memory-backend-failed")]
+        );
 
         let assembled = assembled_with_embedder(&memories, embedder()).await;
         assert!(assembled.retrieval.attempted);
@@ -2172,7 +2146,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_skip_warns_once_with_the_count_and_no_content() {
-        let scope = run_scope().agent_scope();
+        const TENANT: &str = "t-issue-201-skip-warning";
+        let logs = CapturingSubscriber::install_global();
+        let scope = unique_agent_scope(TENANT);
         let store = seeded_store(
             &scope,
             &[
@@ -2188,53 +2164,32 @@ mod tests {
                 .refusing("beta renewal note", Refusal::Errors),
         ));
         let query = MemoryRetrievalQuery::new("renewal");
-        let captured = CapturedEvents::default();
         let outcome = refusing
             .retrieve(&scope, &query, now())
-            .with_subscriber(captured.clone())
             .await
             .expect("the retrieval succeeds");
         assert_eq!(ranked_ids(&outcome), ["mem-c-healthy"]);
 
-        let events = captured.events();
-        assert_eq!(events.len(), 1, "one warning for the retrieval: {events:?}");
-        let event = &events[0];
-        assert_eq!(field(event, "skipped"), Some("2"));
+        // The whole line, exactly: one warning, the code of the first memory
+        // skipped in memory-id order (the misdescribed one), and the fixed
+        // message with these five fields and nothing else, so no error's
+        // message, whichever memory it came from, nor a memory's text or id
+        // can ride along.
         assert_eq!(
-            field(event, "code"),
-            Some("memory-embedding-invalid"),
-            "the code of the first memory skipped, in memory-id order"
+            logged_for(&logs, TENANT),
+            [skip_warning(TENANT, 2, "memory-embedding-invalid")]
         );
-        assert_eq!(field(event, "embedder"), Some(DeterministicEmbedder::MODEL));
-        assert_eq!(field(event, "tenant"), Some(scope.tenant().as_str()));
-        assert_eq!(field(event, "agent"), Some(scope.agent().as_str()));
-        let rendered = format!("{events:?}");
-        for leaked in [
-            "provider rejected",
-            "alpha renewal note",
-            "beta renewal note",
-            "mem-a-bad",
-            "mem-b-refused",
-        ] {
-            assert!(
-                !rendered.contains(leaked),
-                "the warning carries {leaked:?}: {rendered}"
-            );
-        }
 
         // A retrieval that skipped nothing logs nothing.
-        let healthy = InMemoryPrivateMemoryRetriever::new(store)
-            .with_embedder(Arc::new(RefusingEmbedder::new()));
-        let quiet = CapturedEvents::default();
-        healthy
+        InMemoryPrivateMemoryRetriever::new(store)
+            .with_embedder(Arc::new(RefusingEmbedder::new()))
             .retrieve(&scope, &query, now())
-            .with_subscriber(quiet.clone())
             .await
             .expect("the healthy retrieval succeeds");
-        assert!(
-            quiet.events().is_empty(),
-            "a retrieval that skipped nothing logged: {:?}",
-            quiet.events()
+        assert_eq!(
+            logged_for(&logs, TENANT).len(),
+            1,
+            "a retrieval that skipped nothing logged"
         );
     }
 
