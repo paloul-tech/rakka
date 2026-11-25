@@ -34,7 +34,7 @@ enforced row names the test behind it:
 
 | Crate | Owns | Facade feature |
 | --- | --- | --- |
-| `rakka-agent-workflow` | The durable execution kernel the agent domain runs on: durable inbox and outbox acceptance, the dispatcher fleet and its claim filters, timers and triggers, runtime events, the compiled execution IR and graph scheduler, and the OTLP bridge. | `agent-workflow` (default) |
+| `rakka-agent-workflow` | The durable execution kernel the agent domain runs on: durable inbox and outbox acceptance, the dispatcher fleet and its claim filters, timers and triggers, runtime events, the compiled execution IR and graph scheduler, the OTLP bridge, and `AgentRunCore`, the run actor's internals for an owner that drives a run itself. | `agent-workflow` (default) |
 | `rakka-agent` | The agent domain: the five entity classes and their choreography, the loop runtime, the model adapter trait, effects and tool authority, budgets, admission, guardrails, checkpoints, goals and wakes, delegation and coordination, memory traits and retrieval, telemetry, operational queries, schema policy, and a deterministic testkit. | `agent`; `agent-rig` adds the Rig-backed model adapter, `agent-otel` the GenAI convention mapping |
 | `rakka-agent-postgres` | PostgreSQL session memory, context snapshots, agent-private long-term records, the pgvector retriever, and their migrations. | — (depend on it directly) |
 | `rakka-agent-knowledge-graph` | The communal knowledge graph: provenance-bearing claims, the trust lattice, the promotion gate, the portable store SPI with optional keyword search, the adapters that serve `rakka-agent`'s communal read ports, an in-memory reference store, and the backend conformance harness. | — |

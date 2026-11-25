@@ -22,8 +22,8 @@ use rakka_agent_workflow::{
     AgentGraphRunProjection, AgentGraphRunState, AgentGraphWaitReason, AgentPayloadDescriptor,
     AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunCore, AgentRunEngineError,
     AgentRunId, AgentRunInbox, AgentRunRuntimeError, AgentRunState, AgentRunStatus,
-    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess,
-    AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner,
+    AgentStepSuccess, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
     AgentWorkflowSnapshotRegistry, ArtifactEncryptionRef, ArtifactKind, ArtifactRef, InlineState,
     RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
     CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
@@ -1242,4 +1242,129 @@ async fn a_composed_write_is_recorded_by_the_next_core_operation() {
     );
     run_core.snapshot().await.expect("snapshot");
     assert_eq!(registry.outbox_snapshot().due_effect_count(), 0);
+}
+
+/// The phase the registry last recorded an error under for this run.
+fn last_error_phase(registry: &AgentWorkflowSnapshotRegistry) -> String {
+    let recovery = registry.recovery_snapshot();
+    let errors = recovery.sampled_errors();
+    assert_eq!(errors.len(), 1, "one error is recorded");
+    errors[0].phase().to_string()
+}
+
+/// Every operation records its errors under the phase the actor's command
+/// always recorded under. The phase names are part of the registry's
+/// surface; the parity test cannot see one change, since the actor and the
+/// core now run the same method. Each operation is made to fail, and the
+/// phase it recorded is read back. `due_effects` and `snapshot` fail only on
+/// a store or record that cannot be read, and are not reached here.
+#[tokio::test]
+async fn every_operation_records_its_errors_under_the_actors_phase_names() {
+    // On a core whose run was never started, every operation that needs a
+    // run fails.
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-core-phases");
+    let plan = effect_graph_plan(&fixture.workflow);
+    let registry = AgentWorkflowSnapshotRegistry::new();
+    let mut empty = core(&fixture, run_id.clone()).with_snapshot_registry(registry.clone());
+    empty.recover().await.expect("recover");
+
+    macro_rules! fails_under {
+        ($registry:expr, $phase:literal, $call:expr) => {{
+            let result = Box::pin($call).await;
+            assert!(result.is_err(), "{} should fail here", $phase);
+            assert_eq!(last_error_phase($registry), $phase);
+        }};
+    }
+    fails_under!(&registry, "begin-step", empty.begin_step(at(200)));
+    fails_under!(
+        &registry,
+        "succeed-step",
+        empty.succeed_step(advance_to_review(), at(200))
+    );
+    fails_under!(
+        &registry,
+        "fail-step",
+        empty.fail_step("boom".to_string(), at(200))
+    );
+    fails_under!(
+        &registry,
+        "wait",
+        empty.wait(AgentRunWaitReason::Timer, at(200))
+    );
+    fails_under!(&registry, "resume", empty.resume(at(200)));
+    fails_under!(&registry, "complete", empty.complete(at(200)));
+    fails_under!(
+        &registry,
+        "fail-run",
+        empty.fail_run("boom".to_string(), at(200))
+    );
+    fails_under!(
+        &registry,
+        "request-cancellation",
+        empty.request_cancellation("stop".to_string(), None, at(200))
+    );
+    fails_under!(&registry, "cancel", empty.cancel(at(200)));
+    fails_under!(
+        &registry,
+        "begin-compensation",
+        empty.begin_compensation(at(200))
+    );
+    fails_under!(
+        &registry,
+        "mark-graph-ready",
+        empty.mark_graph_ready(&plan, at(200))
+    );
+    fails_under!(
+        &registry,
+        "start-graph-node",
+        empty.start_graph_node(&plan, node_id("input"), at(200))
+    );
+    fails_under!(
+        &registry,
+        "complete-graph-node",
+        empty.complete_graph_node(&plan, node_id("input"), at(200))
+    );
+    fails_under!(
+        &registry,
+        "schedule-graph-node-effect",
+        empty.schedule_graph_node_effect(&plan, effect_request(run_id.clone(), "effect", 200))
+    );
+    let mut invalid = start_command(&fixture.workflow, &run_id, "cmd-invalid");
+    invalid.metadata.tenant = AgentTenantId::new("");
+    fails_under!(&registry, "accept-command", empty.accept_command(invalid));
+
+    // On a core whose run is started, starting it again fails, and an effect
+    // with no id is refused.
+    let fixture = RuntimeFixture::new(workflow());
+    let registry = AgentWorkflowSnapshotRegistry::new();
+    let (scheduled, _plan, _effect) =
+        a_core_with_its_effect_scheduled(&fixture, &run_id, Some(registry.clone())).await;
+    let mut started = scheduled;
+    let mut effect = started
+        .due_effects()
+        .await
+        .expect("due effects")
+        .remove(0)
+        .effect;
+    fails_under!(
+        &registry,
+        "start",
+        started.start(graph_accepted_run_state(&fixture.workflow, &run_id))
+    );
+    fails_under!(
+        &registry,
+        "start-graph",
+        started.start_graph(
+            graph_accepted_run_state(&fixture.workflow, &run_id),
+            &plan,
+            at(300)
+        )
+    );
+    effect.effect_id = AgentEffectId::new("");
+    fails_under!(
+        &registry,
+        "schedule-effect",
+        started.schedule_effect(effect)
+    );
 }

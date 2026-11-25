@@ -405,6 +405,14 @@ pub struct AgentRunActorSnapshot {
 /// Messages are intentionally small runtime commands. Application payloads,
 /// prompts, completions, and tool outputs should be stored out of line and
 /// referenced from `AgentRunState` or `AgentEffect` artifacts.
+///
+/// A write the enum has no arm for, such as dispatching the due outbox,
+/// completing a branch, or applying an effect callback through the bridge,
+/// is made by an owner that holds the run's [`AgentRunCore`] itself and
+/// composes it on the core's own runner and inbox
+/// ([`AgentRunCore::parts_mut`]). Do not write beside the actor through a
+/// second inbox and runner over the same stores: the actor's next write then
+/// loses its compare-and-set.
 pub enum AgentRunActorCommand {
     /// Recover durable run state, inbox, and outbox state.
     Recover {
