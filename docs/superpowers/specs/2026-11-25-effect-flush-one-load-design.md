@@ -81,7 +81,8 @@ lands a cut.
     `exempt_from_wind_down_fence` kinds.
   - The first sink error still ends the flush with that error, and the
     effects after it are not handed over in that round (as `dispatched?`
-    does today).
+    does today). The exception is a revision conflict, which is reloaded and
+    retried (§5.2).
   - No sink error code changes. `outbox-schedule-failed` and the
     `sink_error` mapping stay.
 - **Losing the lost-row repair.** A row the outbox lost is re-created on the
@@ -128,10 +129,25 @@ fn dispatch_all<'a>(
 
 `dispatch` stays as it is, for a single effect.
 
-**A lost compare-and-set** on a new row's schedule mid-batch fails as today:
-the error is returned and the batch stops. The next round, or the next pass,
-loads afresh. A later effect's `Duplicate` answer in the same batch comes
-from the record as loaded, which is what today's per-effect load answers too.
+**A lost compare-and-set is reloaded and retried** (my call, from the builder
+check).
+- **Why.** Today each effect reloads the record just before its own write,
+  so a write by another writer between two effects is absorbed. In a batch,
+  effect `k` is written against a record loaded before it. The likeliest
+  other writer is the dispatcher marking row 0 `Dispatching`, which row 0's
+  own arrival sets off.
+- **The rule.** On `revision-conflict`, and only on it, the sink recovers the
+  inbox again and re-applies that effect's schedule, at most three more times
+  (the dispatcher's own bound for its writes, issue #81). Then it carries on
+  with the next effect on the reloaded inbox. A conflict still losing after
+  the bound, or any other error, ends the batch as today.
+- **The cost.** A round that meets a conflict costs one more load per
+  conflict.
+- **Duplicates.** A later effect's `Duplicate` answer in the same batch comes
+  from the record as last loaded, which is what today's per-effect load
+  answers too.
+- **Empty rounds.** A round with no effect to hand over makes no call and no
+  load.
 
 ### 5.3 The flush
 
@@ -142,16 +158,21 @@ In `dispatch_effects`, the re-drive loop over `ready` becomes one
 **Telemetry:** each effect still gets one `EffectSchedule` segment that ends
 after its durable acceptance (spec 17.6 and 17.9: "`PRODUCER`, after durable
 acceptance").
-- Effect `i`'s segment starts when the flush starts (for `i = 0`) or when
-  effect `i - 1` was accepted. So the shared load is counted in the first
-  effect's segment.
+- Every run segment is anchored at the command's `now`
+  (`AgentSegmentTimer::start(now)`); only its duration is wall-clock. That
+  does not change, so no exported segment's start moves.
+- Effect `i`'s duration is measured from the flush's start (for `i = 0`) or
+  from effect `i - 1`'s acceptance. So the shared load is in the first
+  effect's duration, and the others are shorter than today because they no
+  longer each pay for a load. This uses the existing `AgentSegmentTimer`
+  API, with no new anchoring rule (my call, from the builder check).
 - On an error, the segment of the effect that failed closes as failed, with
   the error's code under `rakka.agent.outbox`, as today.
 - The segments close in effect order, after `dispatch_all` returns. The
   closure collects them in a local list, since it cannot borrow the entity.
   Their timings are taken in the callback.
-- Segment counts and outcomes are unchanged. Only the start point of effects
-  after the first moves.
+- Segment counts and outcomes are unchanged. Only the durations of effects
+  after the first change.
 
 ### 5.4 Counting loads (`rakka_agent::testkit`)
 
@@ -181,9 +202,16 @@ and `reset_loads()`, both additive. Every `load` counts, whatever it answers.
   several effects. When one effect's row is lost (the workflow record is
   deleted, as in `dispatch_missing_row.rs`), the next settle puts every row
   back in one load.
-- **One failure stops the batch:** a sink failure on effect `k` ends the
-  flush with that error. Effects after `k` are not handed over, the run
-  record is unchanged, and the next settle hands over all of them.
+- **One failure stops the batch:** a sink failure on effect `k`, other than
+  a revision conflict, ends the flush with that error. Effects after `k` are
+  not handed over, the run record is unchanged, and the next settle hands
+  over all of them. The failed effect's index is the number of acceptances
+  reported.
+- **A conflict is retried, not failed:** another writer moves the workflow
+  record between effect `k - 1`'s write and effect `k`'s, as the dispatcher
+  marking row 0 `Dispatching` does. The flush still hands over every effect,
+  at one more load. A conflict that keeps losing past the bound ends the
+  flush as today.
 - **Segments:** with several effects, one `EffectSchedule` segment per
   effect, each `ok`, in effect order. With a failure, the failed effect's
   segment is `failed` under `rakka.agent.outbox`.
@@ -195,7 +223,14 @@ and `reset_loads()`, both additive. Every `load` counts, whatever it answers.
 
 - **The test:** a test gated on `RAKKA_POSTGRES_TEST_DSN` drives the
   several-effects run over a `PostgresDurableStateStore` for the workflow
-  record, wrapped in a counter of loads.
+  record, wrapped in a private counter of loads.
+- **Shapes, and what the figure stands for** (my call, from the builder
+  check). The per-round reads are workflow-store loads, and the run store is
+  not read per round, so only the workflow record goes on PostgreSQL. The
+  record's size grows with the run's history, so the measurement is taken at
+  three sizes: fresh, and seeded with 50 and with 200 finished outbox rows.
+  The figure is then both the proof of the cut and the per-round read cost a
+  consumer can size a sweep interval against.
   - It prints loads and wall time per settle, and asserts loads per settle
     is 1.
   - Wall time is printed, never asserted.
@@ -217,7 +252,8 @@ Each is applied alone, and each must be caught:
 - the flush skips the re-drive of effects already `Ready`, so the lost-row
   repair is gone;
 - `accepted` is not called, so the segments are wrong;
-- the batch goes on after an error.
+- the batch goes on after an error that is not a conflict;
+- a revision conflict mid-batch is not retried.
 
 ### 6.5 Validation
 
@@ -265,3 +301,18 @@ the measurements.
    segments start at the previous acceptance.
 3. **The testkit's counter counts every load.**
 4. **Spot 2 is closed by noting it on #25,** not by code.
+5. **A revision conflict mid-batch is reloaded and retried,** at most three
+   more times per effect, the dispatcher's #81 bound (§5.2). Stopping
+   there, as first written, would make a multi-call turn's flush fail more
+   often than today's load-per-effect, which the anti-goals forbid.
+6. **The segments keep their `now` anchor;** only the durations of effects
+   after the first change (§5.3).
+7. **The PostgreSQL measurement** puts the workflow record alone on
+   PostgreSQL, at three history sizes (§6.3).
+
+The builder check found nothing only the owner can decide. Its three
+questions are calls 5 to 7. It also settled, as the builder's own calls:
+- an empty round makes no call;
+- the failed effect's index is the number of acceptances;
+- the PostgreSQL load counter is a private wrapper;
+- the lost-row test covers both a removed row and a deleted record.
