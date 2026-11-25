@@ -53,6 +53,10 @@ rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"
 # never enters the publishable dependency tree.
 proptest.workspace = true
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
+# The gated PostgreSQL measurement of the effect flush's per-round workflow
+# loads (`effect_flush_postgres.rs`, issue #25). Dev-only.
+rakka-persistence-postgres = { path = "../rakka-persistence-postgres", version = "0.1.0" }
+tokio-postgres.workspace = true
 # The in-process fake providers `rig_provider_fake_endpoint.rs` serves. The
 # HTTP backend it injects is rig's own re-exported client
 # (`rig_core::http_client::ReqwestClient`), never a direct `reqwest`

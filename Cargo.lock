@@ -2085,12 +2085,14 @@ dependencies = [
  "rakka-cluster",
  "rakka-core",
  "rakka-persistence",
+ "rakka-persistence-postgres",
  "rakka-remote",
  "rakka-sharding",
  "rig-core",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-postgres",
  "tracing",
 ]
 
