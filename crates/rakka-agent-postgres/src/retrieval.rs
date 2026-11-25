@@ -554,8 +554,7 @@ impl PgvectorPrivateMemoryRetriever {
     ///
     /// # A single unreadable record cannot stall the rebuild
     ///
-    /// The cursor advances on each row's own id before anything fallible runs,
-    /// and a record this binary cannot decode — or whose schema version its
+    /// A record this binary cannot decode — or whose schema version its
     /// fail-closed policy refuses, which is exactly what a rolling upgrade
     /// produces when a newer node has written a newer record shape — is
     /// counted into [`ReindexPage::failed`] and paged past. Propagating it
@@ -563,6 +562,18 @@ impl PgvectorPrivateMemoryRetriever {
     /// never advance beyond the offending row, so every retry would re-read
     /// the same page and fail identically, and the rebuild path would be
     /// unavailable for that agent until the record was repaired by hand.
+    ///
+    /// # Nor can a row whose id this binary refuses
+    ///
+    /// A row whose memory id this binary refuses (one written past the store,
+    /// by a later build with a wider id alphabet or by a hand repair) is
+    /// counted into [`ReindexPage::failed`] and read past, and does not count
+    /// toward `limit`: the call reads on until it has handled `limit` rows
+    /// whose id it reads, or the rows run out (issue #200). So
+    /// [`ReindexPage::next`] is always an id the call read, and a page of
+    /// such rows can never answer the end of a sweep that has more to read.
+    /// One call may read more than `limit` rows; it never makes more than
+    /// `limit` model calls.
     ///
     /// # Nor can a memory the embedder refuses
     ///
@@ -608,14 +619,91 @@ impl PgvectorPrivateMemoryRetriever {
         limit: usize,
     ) -> Result<ReindexPage, MemoryError> {
         let identity = self.embedder_identity()?;
-        let (reference, dimensions, version) = &identity;
         let now_raw = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
-        let after_raw = after.map_or(String::new(), |id| id.as_str().to_string());
+        // The cursor inside the call is the raw text of the last row read,
+        // whatever it holds, so the next read starts past a row whose id
+        // this binary refuses. Every memory id sorts after the empty string.
+        let mut after_raw = after.map_or_else(String::new, |id| id.as_str().to_string());
         let limit = limit.max(1);
-        let limit_raw = i64::try_from(limit).unwrap_or(i64::MAX);
 
-        let rows = self
-            .client
+        let mut indexed = 0u64;
+        let mut skipped = 0u64;
+        let mut failed = 0u64;
+        let mut last: Option<AgentPrivateMemoryId> = None;
+        // Rows whose id this binary reads; only they count toward `limit`.
+        let mut handled = 0usize;
+        let mut ended = false;
+        while handled < limit {
+            let want = limit - handled;
+            let rows = self
+                .unindexed_rows(scope, &identity, now_raw, &after_raw, want)
+                .await?;
+            let read = rows.len();
+            for row in rows {
+                let raw: String = row.get("memory_id");
+                let parsed = AgentPrivateMemoryId::new(raw.as_str());
+                after_raw = raw;
+                // A row whose id this binary refuses is counted and read
+                // past, and does not count toward `limit`: the page ends on
+                // an id it read, or at the end of the rows (issue #200).
+                let Ok(memory_id) = parsed else {
+                    failed += 1;
+                    continue;
+                };
+                handled += 1;
+                last = Some(memory_id);
+                let Ok(memory) = self.decode_memory(&row.get::<_, Vec<u8>>("record")) else {
+                    failed += 1;
+                    continue;
+                };
+                if memory.classification.is_redacted() {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(text) = memory_embedding_text(&memory.content) else {
+                    skipped += 1;
+                    continue;
+                };
+                // A memory the embedder refuses is counted and paged past, as
+                // an unreadable record is: an input one provider always
+                // rejects would otherwise be the first row of every retry
+                // (issue #151). The failure itself is dropped, because a
+                // model's error can quote the text it was given.
+                let Ok(vector) = self.embed_checked(&text).await else {
+                    failed += 1;
+                    continue;
+                };
+                self.store_vector(scope, &memory, &vector, &identity, now)
+                    .await?;
+                indexed += 1;
+            }
+            if read < want {
+                ended = true;
+                break;
+            }
+        }
+        Ok(ReindexPage {
+            indexed,
+            skipped,
+            failed,
+            next: if ended { None } else { last },
+        })
+    }
+
+    /// One read of [`Self::reindex`]: up to `limit` live rows after
+    /// `after_raw`, in memory-id order, that have no vector current for
+    /// `identity`.
+    async fn unindexed_rows(
+        &self,
+        scope: &AgentScope,
+        identity: &(MemoryEmbeddingRef, i32, i64),
+        now_raw: i64,
+        after_raw: &str,
+        limit: usize,
+    ) -> Result<Vec<tokio_postgres::Row>, MemoryError> {
+        let (reference, dimensions, version) = identity;
+        let limit_raw = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.client
             .query(
                 "SELECT m.memory_id, m.record FROM rakka_agent_private_memory m
                  LEFT JOIN rakka_agent_private_memory_embedding e
@@ -636,57 +724,12 @@ impl PgvectorPrivateMemoryRetriever {
                     &dimensions,
                     &version,
                     &now_raw,
-                    &after_raw.as_str(),
+                    &after_raw,
                     &limit_raw,
                 ],
             )
             .await
-            .map_err(map_error)?;
-
-        let more_may_remain = rows.len() == limit;
-        let mut indexed = 0u64;
-        let mut skipped = 0u64;
-        let mut failed = 0u64;
-        let mut last: Option<AgentPrivateMemoryId> = None;
-        for row in rows {
-            // The cursor advances on the row's own id, ahead of every fallible
-            // step, so no single record can hold the sweep on this page.
-            let Ok(memory_id) = AgentPrivateMemoryId::new(row.get::<_, &str>("memory_id")) else {
-                failed += 1;
-                continue;
-            };
-            last = Some(memory_id);
-            let Ok(memory) = self.decode_memory(&row.get::<_, Vec<u8>>("record")) else {
-                failed += 1;
-                continue;
-            };
-            if memory.classification.is_redacted() {
-                skipped += 1;
-                continue;
-            }
-            let Some(text) = memory_embedding_text(&memory.content) else {
-                skipped += 1;
-                continue;
-            };
-            // A memory the embedder refuses is counted and paged past, as an
-            // unreadable record is: an input one provider always rejects
-            // would otherwise be the first row of every retry (issue #151).
-            // The failure itself is dropped, because a model's error can
-            // quote the text it was given.
-            let Ok(vector) = self.embed_checked(&text).await else {
-                failed += 1;
-                continue;
-            };
-            self.store_vector(scope, &memory, &vector, &identity, now)
-                .await?;
-            indexed += 1;
-        }
-        Ok(ReindexPage {
-            indexed,
-            skipped,
-            failed,
-            next: if more_may_remain { last } else { None },
-        })
+            .map_err(map_error)
     }
 
     /// Removes one memory's derived row, returning whether one existed.
@@ -1999,6 +2042,62 @@ mod tests {
             .collect()
     }
 
+    /// Writes a copy of `source`'s row under `raw_id` past the store, as a
+    /// later build with a wider id alphabet would: an id this build refuses.
+    /// `tombstoned` writes the copy withdrawn.
+    async fn plant_refused_id(
+        retriever: &PgvectorPrivateMemoryRetriever,
+        owner: &AgentScope,
+        source: &str,
+        raw_id: &str,
+        tombstoned: bool,
+    ) {
+        assert!(
+            AgentPrivateMemoryId::new(raw_id).is_err(),
+            "{raw_id} is an id this build refuses"
+        );
+        let planted = retriever
+            .client
+            .execute(
+                "INSERT INTO rakka_agent_private_memory
+                     (tenant, agent, memory_id, operation_id, revision, expires_at,
+                      tombstoned, record)
+                 SELECT tenant, agent, $3, operation_id || $3, revision, expires_at,
+                        $5, record
+                 FROM rakka_agent_private_memory
+                 WHERE tenant = $1 AND agent = $2 AND memory_id = $4",
+                &[
+                    &owner.tenant().as_str(),
+                    &owner.agent().as_str(),
+                    &raw_id,
+                    &source,
+                    &tombstoned,
+                ],
+            )
+            .await
+            .expect("plant the row");
+        assert_eq!(planted, 1, "one copy of {source} is planted as {raw_id}");
+    }
+
+    /// The memory ids of one agent in the database's own order.
+    async fn server_order(
+        retriever: &PgvectorPrivateMemoryRetriever,
+        owner: &AgentScope,
+    ) -> Vec<String> {
+        retriever
+            .client
+            .query(
+                "SELECT memory_id FROM rakka_agent_private_memory \
+                 WHERE tenant = $1 AND agent = $2 ORDER BY memory_id",
+                &[&owner.tenant().as_str(), &owner.agent().as_str()],
+            )
+            .await
+            .expect("read the memory ids")
+            .iter()
+            .map(|row| row.get::<_, String>("memory_id"))
+            .collect()
+    }
+
     /// One page as `(indexed, skipped, failed, next)`.
     type PageCounts = (u64, u64, u64, Option<String>);
 
@@ -2156,6 +2255,236 @@ mod tests {
         );
         assert_eq!(embedder.calls(), 3, "one failing call for each memory");
         assert!(embedded(&retriever, &owner).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_reads_past_ids_this_build_refuses_when_dsn_is_set() {
+        // Issue #200's rows: a page made only of a refused id used to answer
+        // no cursor, the answer of a finished sweep, which ended the sweep
+        // before `mem-d` and `mem-e`.
+        for limit in [1, 2] {
+            let embedder = Arc::new(PickyEmbedder::refusing(None, Refusal::Errors));
+            let Some((store, retriever)) = vector_world_over(embedder.clone()).await else {
+                return;
+            };
+            let owner = scope(&unique(), "support");
+            seed(
+                &store,
+                &owner,
+                &[
+                    ("a", EMBEDDABLE),
+                    ("b", EMBEDDABLE),
+                    ("d", EMBEDDABLE),
+                    ("e", EMBEDDABLE),
+                ],
+            )
+            .await;
+            plant_refused_id(&retriever, &owner, "mem-b", "mem-c|x", false).await;
+            assert_eq!(
+                server_order(&retriever, &owner).await,
+                ["mem-a", "mem-b", "mem-c|x", "mem-d", "mem-e"]
+            );
+
+            let expected = if limit == 1 {
+                vec![
+                    page(1, 0, 0, Some("mem-a")),
+                    page(1, 0, 0, Some("mem-b")),
+                    page(1, 0, 1, Some("mem-d")),
+                    page(1, 0, 0, Some("mem-e")),
+                    page(0, 0, 0, None),
+                ]
+            } else {
+                vec![
+                    page(2, 0, 0, Some("mem-b")),
+                    page(2, 0, 1, Some("mem-e")),
+                    page(0, 0, 0, None),
+                ]
+            };
+            assert_eq!(
+                sweep(&retriever, &owner, limit)
+                    .await
+                    .expect("the sweep ends"),
+                expected,
+                "limit {limit}"
+            );
+            assert_eq!(
+                embedded(&retriever, &owner).await,
+                ["mem-a", "mem-b", "mem-d", "mem-e"],
+                "limit {limit}"
+            );
+            assert_eq!(
+                embedder.calls(),
+                4,
+                "limit {limit}: no model call for the refused id"
+            );
+            // Each refused row is counted once a sweep.
+            assert_eq!(
+                sweep(&retriever, &owner, limit)
+                    .await
+                    .expect("the second sweep ends"),
+                vec![page(0, 0, 1, None)],
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// One arrangement of refused ids for
+    /// `pgvector_reindex_reads_past_every_arrangement_of_refused_ids_when_dsn_is_set`.
+    struct RefusedIdCase {
+        name: &'static str,
+        /// Memories seeded through the store, embeddable.
+        seeded: &'static [&'static str],
+        /// A memory seeded through the store with its classification
+        /// `Redacted`, which the pass skips by policy.
+        redacted: Option<&'static str>,
+        /// Rows planted past the store: `(source id, raw id, tombstoned)`.
+        planted: &'static [(&'static str, &'static str, bool)],
+        limit: usize,
+        order: &'static [&'static str],
+        pages: Vec<PageCounts>,
+        embedded: &'static [&'static str],
+        calls: usize,
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_reads_past_every_arrangement_of_refused_ids_when_dsn_is_set() {
+        let cases = [
+            RefusedIdCase {
+                name: "pair",
+                seeded: &["a", "b", "e"],
+                redacted: None,
+                planted: &[("mem-b", "mem-c|1", false), ("mem-b", "mem-c|2", false)],
+                limit: 2,
+                order: &["mem-a", "mem-b", "mem-c|1", "mem-c|2", "mem-e"],
+                pages: vec![page(2, 0, 0, Some("mem-b")), page(1, 0, 2, None)],
+                embedded: &["mem-a", "mem-b", "mem-e"],
+                calls: 3,
+            },
+            RefusedIdCase {
+                name: "first",
+                seeded: &["b", "c"],
+                redacted: None,
+                planted: &[("mem-b", "mem-a|x", false)],
+                limit: 1,
+                order: &["mem-a|x", "mem-b", "mem-c"],
+                pages: vec![
+                    page(1, 0, 1, Some("mem-b")),
+                    page(1, 0, 0, Some("mem-c")),
+                    page(0, 0, 0, None),
+                ],
+                embedded: &["mem-b", "mem-c"],
+                calls: 2,
+            },
+            RefusedIdCase {
+                name: "last",
+                seeded: &["a", "b"],
+                redacted: None,
+                planted: &[("mem-a", "mem-z|x", false)],
+                limit: 1,
+                order: &["mem-a", "mem-b", "mem-z|x"],
+                pages: vec![
+                    page(1, 0, 0, Some("mem-a")),
+                    page(1, 0, 0, Some("mem-b")),
+                    page(0, 0, 1, None),
+                ],
+                embedded: &["mem-a", "mem-b"],
+                calls: 2,
+            },
+            RefusedIdCase {
+                name: "run",
+                seeded: &["a", "d"],
+                redacted: None,
+                planted: &[
+                    ("mem-a", "mem-c|1", false),
+                    ("mem-a", "mem-c|2", false),
+                    ("mem-a", "mem-c|3", false),
+                    ("mem-a", "mem-c|4", false),
+                    ("mem-a", "mem-c|5", false),
+                ],
+                limit: 1,
+                order: &[
+                    "mem-a", "mem-c|1", "mem-c|2", "mem-c|3", "mem-c|4", "mem-c|5", "mem-d",
+                ],
+                pages: vec![
+                    page(1, 0, 0, Some("mem-a")),
+                    page(1, 0, 5, Some("mem-d")),
+                    page(0, 0, 0, None),
+                ],
+                embedded: &["mem-a", "mem-d"],
+                calls: 2,
+            },
+            RefusedIdCase {
+                name: "withdrawn",
+                seeded: &["a", "b"],
+                redacted: None,
+                planted: &[("mem-a", "mem-a|x", true)],
+                limit: 1,
+                order: &["mem-a", "mem-a|x", "mem-b"],
+                pages: vec![
+                    page(1, 0, 0, Some("mem-a")),
+                    page(1, 0, 0, Some("mem-b")),
+                    page(0, 0, 0, None),
+                ],
+                embedded: &["mem-a", "mem-b"],
+                calls: 2,
+            },
+            RefusedIdCase {
+                name: "redacted",
+                seeded: &["a", "e"],
+                redacted: Some("d"),
+                planted: &[("mem-a", "mem-c|1", false), ("mem-a", "mem-c|2", false)],
+                limit: 1,
+                order: &["mem-a", "mem-c|1", "mem-c|2", "mem-d", "mem-e"],
+                pages: vec![
+                    page(1, 0, 0, Some("mem-a")),
+                    page(0, 1, 2, Some("mem-d")),
+                    page(1, 0, 0, Some("mem-e")),
+                    page(0, 0, 0, None),
+                ],
+                embedded: &["mem-a", "mem-e"],
+                calls: 2,
+            },
+        ];
+        for case in cases {
+            let name = case.name;
+            let embedder = Arc::new(PickyEmbedder::refusing(None, Refusal::Errors));
+            let Some((store, retriever)) = vector_world_over(embedder.clone()).await else {
+                return;
+            };
+            let owner = scope(&unique(), "support");
+            let seeded: Vec<(&str, &str)> = case
+                .seeded
+                .iter()
+                .map(|seeded| (*seeded, EMBEDDABLE))
+                .collect();
+            seed(&store, &owner, &seeded).await;
+            if let Some(redacted) = case.redacted {
+                let mut withheld = memory(&owner, redacted, EMBEDDABLE);
+                withheld.classification = MemoryClassification::Redacted;
+                store
+                    .upsert(&owner, &withheld, PrivateMemoryExpectation::Absent)
+                    .await
+                    .expect("seed the redacted memory");
+            }
+            for (source, raw_id, tombstoned) in case.planted {
+                plant_refused_id(&retriever, &owner, source, raw_id, *tombstoned).await;
+            }
+            assert_eq!(server_order(&retriever, &owner).await, case.order, "{name}");
+
+            assert_eq!(
+                sweep(&retriever, &owner, case.limit)
+                    .await
+                    .unwrap_or_else(|error| panic!("{name}: the sweep ends: {error}")),
+                case.pages,
+                "{name}"
+            );
+            assert_eq!(embedded(&retriever, &owner).await, case.embedded, "{name}");
+            assert_eq!(
+                embedder.calls(),
+                case.calls,
+                "{name}: one model call per readable memory the pass embeds"
+            );
+        }
     }
 
     #[tokio::test]
