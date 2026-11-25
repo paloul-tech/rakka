@@ -19,27 +19,27 @@
 //! retries the refused command. A recovery that fails leaves the components
 //! stale and the next command tries again.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFailure, ActorFuture, MetricsRecorder,
-    NoopMetricsRecorder, RakkaError, ReplyTo, Subsystem,
+    RakkaError, ReplyTo, Subsystem,
 };
 use rakka_persistence::DurableStateStore;
 use rakka_workflow::{SystemWorkflowClock, WorkflowClock, WorkflowState};
 
+use crate::run_core::AgentRunCore;
 use crate::{
     AgentCommand, AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentDueEffect, AgentEffect,
-    AgentEffectId, AgentGraphEffectBridge, AgentGraphEffectBridgeError,
-    AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest, AgentGraphRunProjection,
-    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
-    AgentGraphSchedulerTransition, AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance,
-    AgentOutboxError, AgentOutboxResult, AgentRunEngineError, AgentRunId, AgentRunInbox,
-    AgentRunState, AgentRunTransition, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
+    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectScheduleOutcome,
+    AgentGraphEffectScheduleRequest, AgentGraphRunProjection, AgentGraphRunState,
+    AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphSchedulerTransition,
+    AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError,
+    AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunState, AgentRunTransition,
+    AgentRunWaitReason, AgentStepRunner, AgentStepSuccess, AgentTimestampMillis, AgentWorkflow,
+    AgentWorkflowSnapshotRegistry,
 };
 
 /// Shared result type for actor-backed agent run runtime operations.
@@ -578,16 +578,19 @@ pub enum AgentRunActorCommand {
 }
 
 /// Actor-backed host for one durable agent run.
+///
+/// The actor is a mailbox over one [`AgentRunCore`]: each command runs the
+/// core's operation of the same name, and the actor recovers the core when it
+/// starts and when it restarts. An owner that is already a single writer of
+/// the run's stores can hold the core itself instead (see
+/// [`crate::run_core`]).
 pub struct AgentRunActor<RunStore, WorkflowStore, Clock = SystemWorkflowClock>
 where
     RunStore: DurableStateStore<AgentRunState>,
     WorkflowStore: DurableStateStore<WorkflowState>,
     Clock: WorkflowClock,
 {
-    runner: AgentStepRunner<RunStore>,
-    inbox: AgentRunInbox<WorkflowStore, Clock>,
-    graph_runtime: AgentGraphRuntime,
-    snapshots: Option<AgentWorkflowSnapshotRegistry>,
+    core: AgentRunCore<RunStore, WorkflowStore, Clock>,
 }
 
 impl<RunStore, WorkflowStore> AgentRunActor<RunStore, WorkflowStore, SystemWorkflowClock>
@@ -603,13 +606,12 @@ where
         run_store: RunStore,
         workflow_store: WorkflowStore,
     ) -> Self {
-        Self::with_metrics(
+        Self::from_core(AgentRunCore::new(
             workflow,
             run_id,
             run_store,
             workflow_store,
-            Arc::new(NoopMetricsRecorder),
-        )
+        ))
     }
 
     /// Creates an actor-backed runtime with the system clock and explicit
@@ -622,10 +624,13 @@ where
         workflow_store: WorkflowStore,
         metrics: Arc<dyn MetricsRecorder>,
     ) -> Self {
-        Self::from_parts(
-            AgentStepRunner::new(workflow, run_id.clone(), run_store),
-            AgentRunInbox::with_metrics(run_id, workflow_store, metrics),
-        )
+        Self::from_core(AgentRunCore::with_metrics(
+            workflow,
+            run_id,
+            run_store,
+            workflow_store,
+            metrics,
+        ))
     }
 }
 
@@ -644,14 +649,13 @@ where
         workflow_store: WorkflowStore,
         clock: Clock,
     ) -> Self {
-        Self::with_clock_and_metrics(
+        Self::from_core(AgentRunCore::with_clock(
             workflow,
             run_id,
             run_store,
             workflow_store,
             clock,
-            Arc::new(NoopMetricsRecorder),
-        )
+        ))
     }
 
     /// Creates an actor-backed runtime with an explicit clock and metrics
@@ -665,10 +669,14 @@ where
         clock: Clock,
         metrics: Arc<dyn MetricsRecorder>,
     ) -> Self {
-        Self::from_parts(
-            AgentStepRunner::new(workflow, run_id.clone(), run_store),
-            AgentRunInbox::with_clock_and_metrics(run_id, workflow_store, clock, metrics),
-        )
+        Self::from_core(AgentRunCore::with_clock_and_metrics(
+            workflow,
+            run_id,
+            run_store,
+            workflow_store,
+            clock,
+            metrics,
+        ))
     }
 
     /// Creates an actor-backed runtime from already constructed durable facades.
@@ -677,215 +685,43 @@ where
         runner: AgentStepRunner<RunStore>,
         inbox: AgentRunInbox<WorkflowStore, Clock>,
     ) -> Self {
-        Self {
-            runner,
-            inbox,
-            graph_runtime: AgentGraphRuntime::new(),
-            snapshots: None,
-        }
+        Self::from_core(AgentRunCore::from_parts(runner, inbox))
+    }
+
+    /// Hosts an already constructed run core.
+    #[must_use]
+    pub const fn from_core(core: AgentRunCore<RunStore, WorkflowStore, Clock>) -> Self {
+        Self { core }
     }
 
     /// Publishes bounded operational snapshots to the provided registry.
     #[must_use]
-    pub fn with_snapshot_registry(mut self, snapshots: AgentWorkflowSnapshotRegistry) -> Self {
-        self.snapshots = Some(snapshots);
-        self
+    pub fn with_snapshot_registry(self, snapshots: AgentWorkflowSnapshotRegistry) -> Self {
+        Self::from_core(self.core.with_snapshot_registry(snapshots))
+    }
+
+    /// The run core the actor hosts.
+    #[must_use]
+    pub const fn core(&self) -> &AgentRunCore<RunStore, WorkflowStore, Clock> {
+        &self.core
     }
 
     /// Durable run state-machine facade.
     #[must_use]
     pub const fn runner(&self) -> &AgentStepRunner<RunStore> {
-        &self.runner
+        self.core.runner()
     }
 
     /// Durable inbox and outbox facade.
     #[must_use]
     pub const fn inbox(&self) -> &AgentRunInbox<WorkflowStore, Clock> {
-        &self.inbox
+        self.core.inbox()
     }
 
     /// Compiled graph runtime facade.
     #[must_use]
     pub const fn graph_runtime(&self) -> AgentGraphRuntime {
-        self.graph_runtime
-    }
-
-    /// Recovers every component before a command when one of them lost a
-    /// compare-and-set, so the command runs against durable state.
-    async fn refresh_if_stale(&mut self) -> AgentRunRuntimeResult<()> {
-        if self.runner.is_stale() || self.inbox.is_stale() {
-            self.recover_components().await.map(|_snapshot| ())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Answers a command that could not run because the stale recovery before it
-    /// failed.
-    fn reply_refresh_failure(message: AgentRunActorCommand, error: AgentRunRuntimeError) {
-        match message {
-            AgentRunActorCommand::Recover { reply_to }
-            | AgentRunActorCommand::Snapshot { reply_to } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-            AgentRunActorCommand::AcceptCommand { reply_to, .. } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-            AgentRunActorCommand::Start { reply_to, .. }
-            | AgentRunActorCommand::StartGraph { reply_to, .. }
-            | AgentRunActorCommand::BeginStep { reply_to, .. }
-            | AgentRunActorCommand::SucceedStep { reply_to, .. }
-            | AgentRunActorCommand::FailStep { reply_to, .. }
-            | AgentRunActorCommand::Wait { reply_to, .. }
-            | AgentRunActorCommand::Resume { reply_to, .. }
-            | AgentRunActorCommand::Complete { reply_to, .. }
-            | AgentRunActorCommand::FailRun { reply_to, .. }
-            | AgentRunActorCommand::RequestCancellation { reply_to, .. }
-            | AgentRunActorCommand::Cancel { reply_to, .. }
-            | AgentRunActorCommand::BeginCompensation { reply_to, .. } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-            AgentRunActorCommand::MarkGraphReady { reply_to, .. }
-            | AgentRunActorCommand::StartGraphNode { reply_to, .. }
-            | AgentRunActorCommand::CompleteGraphNode { reply_to, .. } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-            AgentRunActorCommand::ScheduleGraphNodeEffect { reply_to, .. } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-            AgentRunActorCommand::ScheduleEffect { reply_to, .. } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-            AgentRunActorCommand::DueEffects { reply_to } => {
-                let _reply_dropped = reply_to.reply(Err(error));
-            }
-        }
-    }
-
-    async fn recover_components(&mut self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
-        let result = async {
-            self.runner.recover().await?;
-            self.inbox.recover().await?;
-            self.reconcile_recovered_graph_effects().await?;
-            self.snapshot()
-        }
-        .await;
-        self.record_snapshot_result("recover", &result);
-        result
-    }
-
-    /// Re-links durable outbox effects to their graph nodes after recovery.
-    ///
-    /// An effect is committed to the durable outbox before the graph transition
-    /// that records it is persisted (see
-    /// [`AgentGraphEffectBridge::schedule_node_effect`]). A crash in that window
-    /// leaves the effect enqueued with no node link, which would orphan its
-    /// completion (`node_id_for_effect` would fail with `UnknownEffect`). The
-    /// run actor never re-drives in-flight nodes, so recovery restores the link
-    /// here from the self-describing recovered effects. The pass is idempotent:
-    /// a run with no graph state, no in-flight effects, or nothing to relink
-    /// persists nothing.
-    ///
-    /// Only the outbox entries no node lists yet are decoded (an entry's
-    /// message id is its effect id), whatever their status, so an effect that
-    /// exhausted while the actor was down is still reached and a healthy run
-    /// decodes nothing. An entry whose payload does not decode as an agent
-    /// effect is skipped with a warning that carries no ids: it cannot be
-    /// re-linked, and it must not stop the run from recovering.
-    async fn reconcile_recovered_graph_effects(&mut self) -> AgentRunRuntimeResult<()> {
-        let Some(graph) = self
-            .runner
-            .state()?
-            .and_then(|state| state.graph_state.clone())
-        else {
-            return Ok(());
-        };
-        let listed: BTreeSet<&str> = graph
-            .node_states
-            .values()
-            .flat_map(|node| node.scheduled_effect_ids.iter().map(AgentEffectId::as_str))
-            .collect();
-        let read = self
-            .inbox
-            .outbox_effects(|entry| !listed.contains(entry.message_id().as_str()))?;
-        if read.undecodable > 0 {
-            tracing::warn!(
-                skipped = read.undecodable,
-                "graph recovery skipped outbox entries that do not decode as agent effects"
-            );
-        }
-        let effects: Vec<AgentEffect> = read.effects.into_iter().map(|due| due.effect).collect();
-        if effects.is_empty() {
-            return Ok(());
-        }
-        let transition = self
-            .graph_runtime
-            .effect_bridge()
-            .reconcile_recovered_effects(graph, &effects);
-        if transition.changed_node_ids.is_empty() {
-            return Ok(());
-        }
-        let now = effects
-            .iter()
-            .map(|effect| effect.created_at)
-            .max()
-            .unwrap_or_default();
-        self.runner
-            .update_graph_state(transition.state, now)
-            .await?;
-        Ok(())
-    }
-
-    fn snapshot(&self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
-        let run_state = self.runner.state()?.cloned();
-        let graph = run_state
-            .as_ref()
-            .and_then(|state| state.graph_state.as_ref())
-            .map(AgentGraphRunProjection::from_graph_state);
-        let recoverable_command_count = self
-            .inbox
-            .inner()
-            .recoverable_inbox()
-            .map_err(AgentInboxError::from)?
-            .len();
-        let due_effect_count = self.inbox.due_effects()?.len();
-        Ok(AgentRunActorSnapshot {
-            run_id: self.runner.run_id().clone(),
-            run_state,
-            graph,
-            recoverable_command_count,
-            due_effect_count,
-        })
-    }
-
-    fn record_snapshot_result(
-        &self,
-        phase: &'static str,
-        result: &AgentRunRuntimeResult<AgentRunActorSnapshot>,
-    ) {
-        if let Some(snapshots) = &self.snapshots {
-            match result {
-                Ok(snapshot) => snapshots.record_run_actor_snapshot(snapshot),
-                Err(error) => {
-                    snapshots.record_run_runtime_error(self.runner.run_id().clone(), phase, error);
-                }
-            }
-        }
-    }
-
-    fn record_current_snapshot(&self, phase: &'static str) {
-        let result = self.snapshot();
-        self.record_snapshot_result(phase, &result);
-    }
-
-    fn record_operation_result<T>(&self, phase: &'static str, result: &AgentRunRuntimeResult<T>) {
-        if let Err(error) = result {
-            if let Some(snapshots) = &self.snapshots {
-                snapshots.record_run_runtime_error(self.runner.run_id().clone(), phase, error);
-            }
-        } else {
-            self.record_current_snapshot(phase);
-        }
+        self.core.graph_runtime()
     }
 }
 
@@ -899,9 +735,7 @@ where
 
     fn started<'a>(&'a mut self, _ctx: &'a mut ActorContext<Self::Msg>) -> ActorFuture<'a> {
         actor_future(async move {
-            self.recover_components()
-                .await
-                .map_err(runtime_error_to_rakka)?;
+            self.core.recover().await.map_err(runtime_error_to_rakka)?;
             Ok(ActorAction::Continue)
         })
     }
@@ -912,9 +746,7 @@ where
         _failure: &'a ActorFailure,
     ) -> ActorFuture<'a> {
         actor_future(async move {
-            self.recover_components()
-                .await
-                .map_err(runtime_error_to_rakka)?;
+            self.core.recover().await.map_err(runtime_error_to_rakka)?;
             Ok(ActorAction::Continue)
         })
     }
@@ -925,41 +757,22 @@ where
         msg: Self::Msg,
     ) -> ActorFuture<'a> {
         actor_future(async move {
-            if !matches!(msg, AgentRunActorCommand::Recover { .. }) {
-                if let Err(error) = self.refresh_if_stale().await {
-                    Self::reply_refresh_failure(msg, error);
-                    return Ok(ActorAction::Continue);
-                }
-            }
+            let core = &mut self.core;
             match msg {
                 AgentRunActorCommand::Recover { reply_to } => {
-                    let _reply_dropped = reply_to.reply(self.recover_components().await);
+                    let _reply_dropped = reply_to.reply(core.recover().await);
                 }
                 AgentRunActorCommand::Snapshot { reply_to } => {
-                    let result = self.snapshot();
-                    self.record_snapshot_result("snapshot", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.snapshot().await);
                 }
                 AgentRunActorCommand::AcceptCommand { command, reply_to } => {
-                    let result = self
-                        .inbox
-                        .accept_command(command)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("accept-command", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.accept_command(command).await);
                 }
                 AgentRunActorCommand::Start {
                     initial_state,
                     reply_to,
                 } => {
-                    let result = self
-                        .runner
-                        .start(initial_state)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("start", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.start(initial_state).await);
                 }
                 AgentRunActorCommand::StartGraph {
                     initial_state,
@@ -967,24 +780,15 @@ where
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .graph_runtime
-                        .start_graph_run(&mut self.runner, initial_state, &plan, now)
-                        .await;
-                    self.record_operation_result("start-graph", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped =
+                        reply_to.reply(core.start_graph(initial_state, &plan, now).await);
                 }
                 AgentRunActorCommand::MarkGraphReady {
                     plan,
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .graph_runtime
-                        .mark_ready_nodes(&mut self.runner, &plan, now)
-                        .await;
-                    self.record_operation_result("mark-graph-ready", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.mark_graph_ready(&plan, now).await);
                 }
                 AgentRunActorCommand::StartGraphNode {
                     plan,
@@ -992,12 +796,8 @@ where
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .graph_runtime
-                        .start_node(&mut self.runner, &plan, node_id, now)
-                        .await;
-                    self.record_operation_result("start-graph-node", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped =
+                        reply_to.reply(core.start_graph_node(&plan, node_id, now).await);
                 }
                 AgentRunActorCommand::CompleteGraphNode {
                     plan,
@@ -1005,103 +805,53 @@ where
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .graph_runtime
-                        .complete_node(&mut self.runner, &plan, node_id, now)
-                        .await;
-                    self.record_operation_result("complete-graph-node", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped =
+                        reply_to.reply(core.complete_graph_node(&plan, node_id, now).await);
                 }
                 AgentRunActorCommand::ScheduleGraphNodeEffect {
                     plan,
                     request,
                     reply_to,
                 } => {
-                    let result = self
-                        .graph_runtime
-                        .schedule_node_effect(&mut self.runner, &mut self.inbox, &plan, request)
-                        .await;
-                    self.record_operation_result("schedule-graph-node-effect", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped =
+                        reply_to.reply(core.schedule_graph_node_effect(&plan, request).await);
                 }
                 AgentRunActorCommand::BeginStep { now, reply_to } => {
-                    let result = self
-                        .runner
-                        .begin_step(now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("begin-step", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.begin_step(now).await);
                 }
                 AgentRunActorCommand::SucceedStep {
                     success,
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .runner
-                        .succeed_step(success, now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("succeed-step", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.succeed_step(success, now).await);
                 }
                 AgentRunActorCommand::FailStep {
                     error_code,
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .runner
-                        .fail_step(error_code, now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("fail-step", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.fail_step(error_code, now).await);
                 }
                 AgentRunActorCommand::Wait {
                     reason,
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .runner
-                        .wait(reason, now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("wait", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.wait(reason, now).await);
                 }
                 AgentRunActorCommand::Resume { now, reply_to } => {
-                    let result = self
-                        .runner
-                        .resume(now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("resume", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.resume(now).await);
                 }
                 AgentRunActorCommand::Complete { now, reply_to } => {
-                    let result = self
-                        .runner
-                        .complete(now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("complete", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.complete(now).await);
                 }
                 AgentRunActorCommand::FailRun {
                     error_code,
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .runner
-                        .fail_run(error_code, now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("fail-run", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.fail_run(error_code, now).await);
                 }
                 AgentRunActorCommand::RequestCancellation {
                     reason_code,
@@ -1109,46 +859,22 @@ where
                     now,
                     reply_to,
                 } => {
-                    let result = self
-                        .runner
-                        .request_cancellation(reason_code, reason_summary, now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("request-cancellation", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(
+                        core.request_cancellation(reason_code, reason_summary, now)
+                            .await,
+                    );
                 }
                 AgentRunActorCommand::Cancel { now, reply_to } => {
-                    let result = self
-                        .runner
-                        .cancel(now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("cancel", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.cancel(now).await);
                 }
                 AgentRunActorCommand::BeginCompensation { now, reply_to } => {
-                    let result = self
-                        .runner
-                        .begin_compensation(now)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("begin-compensation", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.begin_compensation(now).await);
                 }
                 AgentRunActorCommand::ScheduleEffect { effect, reply_to } => {
-                    let result = self
-                        .inbox
-                        .schedule_effect(effect)
-                        .await
-                        .map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("schedule-effect", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.schedule_effect(effect).await);
                 }
                 AgentRunActorCommand::DueEffects { reply_to } => {
-                    let result: AgentOutboxResult<Vec<AgentDueEffect>> = self.inbox.due_effects();
-                    let result = result.map_err(AgentRunRuntimeError::from);
-                    self.record_operation_result("due-effects", &result);
-                    let _reply_dropped = reply_to.reply(result);
+                    let _reply_dropped = reply_to.reply(core.due_effects().await);
                 }
             }
             Ok(ActorAction::Continue)
