@@ -647,6 +647,20 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Not changed.** A memory that failed stays a candidate, so the next sweep reads it again, and a rerun reads exactly what is still missing. `index_memory` for one memory id still returns the embedder's error, which is how to learn why one memory fails. A write that fails because of one record's own data is still returned, and still met again by every retry.
 
+- Issues #199 and #200 ("a private memory whose digest the derived table refuses holds the pgvector reindex sweep on it"; "a pgvector reindex page made only of rows whose ids this build refuses ends the sweep early") change what `PgvectorPrivateMemoryRetriever::reindex` (`rakka-agent-postgres`) answers for a row it cannot use, and what the PostgreSQL knowledge graph's `unembedded_claims` page and `index_claims` pass (`rakka-agent-knowledge-graph-postgres`) answer for a claim id they refuse. No type, field, code or schema is added.
+
+  | | Before | Now |
+  |---|---|---|
+  | A page of the private pass made only of rows whose memory id this build refuses (written past the store, by a later build with a wider id alphabet or by a hand repair) | `next = None`, the answer of a finished sweep, though more rows followed; starting over read the refused row first again | Each is counted in `ReindexPage::failed` and read past. The page ends on an id it read, or at the end of the rows |
+  | A full page of either communal pass whose last row holds a claim id this build refuses | An error, on this page and every retry | Counted (`undecodable` / `skipped`) and read past |
+  | A private memory whose vector the database refuses to store for its own data (SQLSTATE class 22 or 23, such as a NUL in its digest), or whose revision is outside `BIGINT` | `reindex` returned the write error, and every retry met that memory again | Counted in `ReindexPage::failed` and paged past |
+  | Any other failed write | Ends the call | Unchanged |
+  | An embedder that declares version 0, or a model holding a NUL | The first write failed (`memory-backend-failed`); `retrieve` answered no hits | `memory-embedding-invalid` from `reindex`, `index_memory` and `retrieve`, before a page is read or the model is called |
+
+  **What this changes for a caller.** A refused-id row does not count toward `limit`, so one call may read more rows than `limit`, all of the extra ones refused ids; it makes no more model calls or writes than `limit`. `ReindexPage::failed` now also counts a memory the database would not store, again without saying which cause it was. A caller that stopped a sweep on the returned write error now gets a page and goes on. This replaces the last sentence of issue #151's **Not changed**: a write refused for one record's own data is no longer returned.
+
+  **Not changed.** `index_memory` for one memory still returns the database's error for it, which is how to learn why that memory fails. A memory counted in `failed` stays a candidate, so the next sweep reads it again. The in-memory store cannot hold a refused claim id.
+
 - Issues #133 and #132 ("a call the run cancels before it is sent takes its gate and its attempts with it") change what a run does with the approval or authorization of a call it cancels unsent, and with the attempts that call reserved. No type, field, status, code, event kind or schema version is added.
 
   | State | Before | Now |
