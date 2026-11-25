@@ -714,9 +714,29 @@ impl Debug for AgentMemoryRetrieval {
 /// before ranking, exactly the contract a vector backend implements in SQL.
 /// Without an embedder it scores by deterministic token overlap and returns
 /// only overlapping memories; with one it scores by cosine similarity over
-/// vectors embedded on the fly and returns every admitted candidate ranked,
-/// the way a vector index would. It reports no index watermark, honestly:
-/// there is no index.
+/// vectors embedded on the fly and returns every admitted candidate it can
+/// embed, ranked, the way a vector index would. It reports no index
+/// watermark, honestly: there is no index.
+///
+/// # A memory its embedder refuses is left out
+///
+/// A memory whose embedding fails (an error from the embedder, or a vector
+/// of the wrong length or with a component that is not finite) is left out
+/// of the ranking, as the pgvector backend leaves out a memory its `reindex`
+/// could not embed. Returning the error, as this retriever once did, failed
+/// every retrieval for that agent, whatever the query, for as long as the
+/// memory was admitted (issue #201).
+///
+/// Each retrieval that left any memory out logs one warning with the
+/// agent's tenant and id, how many it left out, the error code of the first,
+/// and the embedder's model. It never logs the error's message, which can
+/// quote the text the embedder was given, nor a memory's text or id.
+///
+/// A query the embedder refuses still fails the retrieval: there is nothing
+/// to rank against. An embedder that accepts the query and then fails for
+/// every memory answers no memories rather than an error, after one call for
+/// each admitted memory (at most [`AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES`]);
+/// the warning is where that shows.
 #[derive(Clone)]
 pub struct InMemoryPrivateMemoryRetriever {
     store: Arc<dyn AgentPrivateMemoryStore>,
@@ -832,18 +852,48 @@ impl AgentPrivateMemoryRetriever for InMemoryPrivateMemoryRetriever {
                 }
                 Some(embedder) => {
                     let reference = embedder.embedding_ref();
+                    // A query the embedder refuses fails the retrieval: there
+                    // is nothing to rank against.
                     let query_vector = embed_memory_vector(embedder.as_ref(), query.text()).await?;
                     let mut ranked = Vec::with_capacity(admitted.len());
+                    let mut skipped = 0usize;
+                    let mut first_code = "";
                     for memory in admitted {
                         let Some(text) = memory_embedding_text(&memory.content) else {
                             continue;
                         };
-                        let vector = embed_memory_vector(embedder.as_ref(), &text).await?;
+                        // A memory the embedder refuses is left out, as the
+                        // pgvector backend leaves out a memory its reindex
+                        // could not embed: returning the error would fail
+                        // every retrieval for this agent while the memory is
+                        // admitted (issue #201). The error is dropped, because
+                        // a model's error can quote the text it was given.
+                        let vector = match embed_memory_vector(embedder.as_ref(), &text).await {
+                            Ok(vector) => vector,
+                            Err(error) => {
+                                if skipped == 0 {
+                                    first_code = error.code();
+                                }
+                                skipped += 1;
+                                continue;
+                            }
+                        };
                         ranked.push(RetrievedPrivateMemory {
                             memory,
                             relevance_bps: cosine_relevance_bps(&query_vector, &vector),
                             embedding: Some(reference.clone()),
                         });
+                    }
+                    if skipped > 0 {
+                        tracing::warn!(
+                            tenant = scope.tenant().as_str(),
+                            agent = scope.agent().as_str(),
+                            skipped,
+                            code = first_code,
+                            embedder = reference.model.as_str(),
+                            "the in-memory retriever left out memories its embedder refused; \
+                             they are not ranked while the embedder refuses them"
+                        );
                     }
                     ranked
                 }
@@ -1450,6 +1500,7 @@ mod tests {
         PrivateMemoryTombstoneRequest, SessionMemoryEntry, SnapshotSessionEntry,
     };
     use crate::testkit::{DeterministicEmbedder, ScriptedPrivateMemoryRetriever};
+    use tracing::instrument::WithSubscriber;
 
     fn run_scope() -> AgentRunScope {
         AgentRunScope::new(
@@ -1813,6 +1864,378 @@ mod tests {
             .await
             .expect_err("the mismatch fails closed");
         assert_eq!(error.code(), "memory-embedding-invalid");
+    }
+
+    // ------------------------------------------------------------------
+    // A memory the embedder refuses (issue #201).
+    // ------------------------------------------------------------------
+
+    /// How [`RefusingEmbedder`] treats one exact text.
+    #[derive(Clone, Copy)]
+    enum Refusal {
+        /// The embedder errors, with a message that quotes the text, as a
+        /// provider's content filter can.
+        Errors,
+        /// The embedder answers a vector shorter than it declares.
+        Misdescribes,
+    }
+
+    /// Wraps [`DeterministicEmbedder`] and refuses the exact texts it names.
+    struct RefusingEmbedder {
+        inner: DeterministicEmbedder,
+        refused: Vec<(&'static str, Refusal)>,
+    }
+
+    impl RefusingEmbedder {
+        fn new() -> Self {
+            Self {
+                inner: DeterministicEmbedder::new(),
+                refused: Vec::new(),
+            }
+        }
+
+        fn refusing(mut self, text: &'static str, how: Refusal) -> Self {
+            self.refused.push((text, how));
+            self
+        }
+    }
+
+    impl AgentMemoryEmbedder for RefusingEmbedder {
+        fn embedding_ref(&self) -> MemoryEmbeddingRef {
+            self.inner.embedding_ref()
+        }
+
+        fn embed<'a>(&'a self, text: &'a str) -> MemoryFuture<'a, Vec<f32>> {
+            let how = self
+                .refused
+                .iter()
+                .find(|(refused, _)| *refused == text)
+                .map(|(_, how)| *how);
+            match how {
+                Some(Refusal::Errors) => Box::pin(async move {
+                    Err(MemoryError::Backend {
+                        backend: "test-embedder".to_string(),
+                        message: format!("provider rejected input: {text}"),
+                    })
+                }),
+                Some(Refusal::Misdescribes) => Box::pin(async move { Ok(vec![1.0; 3]) }),
+                None => self.inner.embed(text),
+            }
+        }
+    }
+
+    /// One captured event: its fields as (name, rendered value), the message
+    /// included as `message`.
+    type CapturedEvent = Vec<(String, String)>;
+
+    /// A `tracing` subscriber that records every event it is given, so a test
+    /// can read what a retrieval logged.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    impl CapturedEvents {
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.0
+                .lock()
+                .expect("the capture lock is never poisoned")
+                .clone()
+        }
+    }
+
+    /// Renders an event's fields into a [`CapturedEvent`].
+    struct FieldRecorder<'a>(&'a mut CapturedEvent);
+
+    impl tracing::field::Visit for FieldRecorder<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = CapturedEvent::new();
+            event.record(&mut FieldRecorder(&mut fields));
+            self.0
+                .lock()
+                .expect("the capture lock is never poisoned")
+                .push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The value of one field of a captured event.
+    fn field<'a>(event: &'a CapturedEvent, name: &str) -> Option<&'a str> {
+        event
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The query of the issue's table that the refused memory answers best.
+    const NEAR_QUERY: &str = "renewal contract terms";
+    /// The text the embedder refuses. It shares more words with
+    /// [`NEAR_QUERY`] than the healthy memory does, so it is the memory
+    /// nearest to that query; it is not the query itself, which the embedder
+    /// must accept for the retrieval to rank anything.
+    const REFUSED_TEXT: &str = "the renewal contract terms are net-30";
+    /// A memory the embedder accepts.
+    const HEALTHY_TEXT: &str = "renewal contract signed in march";
+
+    fn ranked_ids(outcome: &MemoryRetrievalOutcome) -> Vec<&str> {
+        outcome
+            .memories
+            .iter()
+            .map(|retrieved| retrieved.memory.memory_id.as_str())
+            .collect()
+    }
+
+    /// Assembles turn one of a run whose retriever ranks the given memories
+    /// with `embedder`.
+    async fn assembled_with_embedder(
+        memories: &[(&str, &str)],
+        embedder: RefusingEmbedder,
+    ) -> AssembledContext {
+        let scope = run_scope();
+        let store = seeded_store(&scope.agent_scope(), memories).await;
+        let retrieval = AgentMemoryRetrieval::new(
+            Arc::new(
+                InMemoryPrivateMemoryRetriever::new(store.clone())
+                    .with_embedder(Arc::new(embedder)),
+            ),
+            store,
+            AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
+        );
+        let (memory, scope) = memory_with_session(Some(retrieval)).await;
+        let reference = AgentContextSnapshotRef::for_turn(&scope, 1).expect("reference");
+        assemble_context(
+            &memory,
+            &scope,
+            None,
+            &reference,
+            1,
+            AgentRevisionNumber::INITIAL,
+            now(),
+        )
+        .await
+        .expect("assembly")
+    }
+
+    #[tokio::test]
+    async fn a_memory_the_embedder_refuses_is_left_out_and_the_rest_rank() {
+        let scope = run_scope().agent_scope();
+        let store = seeded_store(
+            &scope,
+            &[("refused", REFUSED_TEXT), ("healthy", HEALTHY_TEXT)],
+        )
+        .await;
+        // Without the refusal, the refused memory is the one nearest to the
+        // first query, so its absence below is the skip and not the ranking.
+        let unrefused = InMemoryPrivateMemoryRetriever::new(store.clone())
+            .with_embedder(Arc::new(DeterministicEmbedder::new()))
+            .retrieve(&scope, &MemoryRetrievalQuery::new(NEAR_QUERY), now())
+            .await
+            .expect("the unrefused retrieval succeeds");
+        assert_eq!(ranked_ids(&unrefused), ["mem-refused", "mem-healthy"]);
+
+        let embedder = Arc::new(RefusingEmbedder::new().refusing(REFUSED_TEXT, Refusal::Errors));
+        let poisoned = InMemoryPrivateMemoryRetriever::new(store).with_embedder(embedder.clone());
+        let control = InMemoryPrivateMemoryRetriever::new(
+            seeded_store(&scope, &[("healthy", HEALTHY_TEXT)]).await,
+        )
+        .with_embedder(embedder);
+
+        for text in [NEAR_QUERY, "something unrelated entirely"] {
+            let query = MemoryRetrievalQuery::new(text);
+            let answered = poisoned
+                .retrieve(&scope, &query, now())
+                .await
+                .expect("one refused memory no longer fails the retrieval");
+            let expected = control
+                .retrieve(&scope, &query, now())
+                .await
+                .expect("the control retrieval succeeds");
+            assert_eq!(ranked_ids(&answered), ["mem-healthy"], "query {text:?}");
+            assert_eq!(
+                answered, expected,
+                "the poisoned agent answers what an agent without the refused memory answers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_misdescribed_vector_for_one_memory_is_left_out_the_same_way() {
+        let scope = run_scope().agent_scope();
+        let retriever = InMemoryPrivateMemoryRetriever::new(
+            seeded_store(
+                &scope,
+                &[("refused", REFUSED_TEXT), ("healthy", HEALTHY_TEXT)],
+            )
+            .await,
+        )
+        .with_embedder(Arc::new(
+            RefusingEmbedder::new().refusing(REFUSED_TEXT, Refusal::Misdescribes),
+        ));
+        let outcome = retriever
+            .retrieve(&scope, &MemoryRetrievalQuery::new(NEAR_QUERY), now())
+            .await
+            .expect("one misdescribed vector no longer fails the retrieval");
+        assert_eq!(ranked_ids(&outcome), ["mem-healthy"]);
+    }
+
+    #[tokio::test]
+    async fn a_query_the_embedder_refuses_still_fails_the_retrieval() {
+        let scope = run_scope().agent_scope();
+        let retriever = InMemoryPrivateMemoryRetriever::new(
+            seeded_store(&scope, &[("healthy", HEALTHY_TEXT)]).await,
+        )
+        .with_embedder(Arc::new(
+            RefusingEmbedder::new().refusing("renewal", Refusal::Errors),
+        ));
+        let error = retriever
+            .retrieve(&scope, &MemoryRetrievalQuery::new("renewal"), now())
+            .await
+            .expect_err("a query the embedder refuses fails the retrieval");
+        assert_eq!(error.code(), "memory-backend-failed");
+    }
+
+    #[tokio::test]
+    async fn the_assembly_selects_the_healthy_memory_and_is_not_degraded() {
+        let assembled = assembled_with_embedder(
+            &[("refused", REFUSED_TEXT), ("healthy", HEALTHY_TEXT)],
+            RefusingEmbedder::new().refusing(REFUSED_TEXT, Refusal::Errors),
+        )
+        .await;
+        assert!(
+            !assembled.retrieval.degraded,
+            "one refused memory no longer degrades the turn"
+        );
+        assert_eq!(assembled.retrieval.selected, 1);
+        let selected: Vec<&str> = assembled
+            .snapshot
+            .private_memory
+            .iter()
+            .map(|selection| selection.memory_id.as_str())
+            .collect();
+        assert_eq!(selected, ["mem-healthy"]);
+    }
+
+    #[tokio::test]
+    async fn an_embedder_refusing_every_memory_answers_empty_and_warns_once() {
+        let scope = run_scope().agent_scope();
+        let memories = [("refused", REFUSED_TEXT), ("healthy", HEALTHY_TEXT)];
+        let embedder = || {
+            RefusingEmbedder::new()
+                .refusing(REFUSED_TEXT, Refusal::Errors)
+                .refusing(HEALTHY_TEXT, Refusal::Errors)
+        };
+        let retriever = InMemoryPrivateMemoryRetriever::new(seeded_store(&scope, &memories).await)
+            .with_embedder(Arc::new(embedder()));
+        let captured = CapturedEvents::default();
+        let outcome = retriever
+            .retrieve(&scope, &MemoryRetrievalQuery::new("renewal"), now())
+            .with_subscriber(captured.clone())
+            .await
+            .expect("an embedder that fails after the query is not an error");
+        assert!(outcome.memories.is_empty());
+        let events = captured.events();
+        assert_eq!(events.len(), 1, "one warning for the retrieval: {events:?}");
+        assert_eq!(field(&events[0], "skipped"), Some("2"));
+
+        let assembled = assembled_with_embedder(&memories, embedder()).await;
+        assert!(assembled.retrieval.attempted);
+        assert!(
+            !assembled.retrieval.degraded,
+            "the retrieval answered, so the turn is not degraded"
+        );
+        assert_eq!(assembled.retrieval.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn a_skip_warns_once_with_the_count_and_no_content() {
+        let scope = run_scope().agent_scope();
+        let store = seeded_store(
+            &scope,
+            &[
+                ("a-bad", "alpha renewal note"),
+                ("b-refused", "beta renewal note"),
+                ("c-healthy", "gamma renewal note"),
+            ],
+        )
+        .await;
+        let refusing = InMemoryPrivateMemoryRetriever::new(store.clone()).with_embedder(Arc::new(
+            RefusingEmbedder::new()
+                .refusing("alpha renewal note", Refusal::Misdescribes)
+                .refusing("beta renewal note", Refusal::Errors),
+        ));
+        let query = MemoryRetrievalQuery::new("renewal");
+        let captured = CapturedEvents::default();
+        let outcome = refusing
+            .retrieve(&scope, &query, now())
+            .with_subscriber(captured.clone())
+            .await
+            .expect("the retrieval succeeds");
+        assert_eq!(ranked_ids(&outcome), ["mem-c-healthy"]);
+
+        let events = captured.events();
+        assert_eq!(events.len(), 1, "one warning for the retrieval: {events:?}");
+        let event = &events[0];
+        assert_eq!(field(event, "skipped"), Some("2"));
+        assert_eq!(
+            field(event, "code"),
+            Some("memory-embedding-invalid"),
+            "the code of the first memory skipped, in memory-id order"
+        );
+        assert_eq!(field(event, "embedder"), Some(DeterministicEmbedder::MODEL));
+        assert_eq!(field(event, "tenant"), Some(scope.tenant().as_str()));
+        assert_eq!(field(event, "agent"), Some(scope.agent().as_str()));
+        let rendered = format!("{events:?}");
+        for leaked in [
+            "provider rejected",
+            "alpha renewal note",
+            "beta renewal note",
+            "mem-a-bad",
+            "mem-b-refused",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "the warning carries {leaked:?}: {rendered}"
+            );
+        }
+
+        // A retrieval that skipped nothing logs nothing.
+        let healthy = InMemoryPrivateMemoryRetriever::new(store)
+            .with_embedder(Arc::new(RefusingEmbedder::new()));
+        let quiet = CapturedEvents::default();
+        healthy
+            .retrieve(&scope, &query, now())
+            .with_subscriber(quiet.clone())
+            .await
+            .expect("the healthy retrieval succeeds");
+        assert!(
+            quiet.events().is_empty(),
+            "a retrieval that skipped nothing logged: {:?}",
+            quiet.events()
+        );
     }
 
     // ------------------------------------------------------------------
