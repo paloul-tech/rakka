@@ -957,10 +957,17 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// embedding under `reference`: none at all, or one from another model,
     /// dimension count or pipeline version. The empty set lists nothing.
     ///
-    /// The page reads at most `limit` claims (clamped to
-    /// `1..=`[`CLAIM_EMBEDDING_PAGE_MAX_CLAIMS`]) in ascending claim-id order
-    /// after the cursor. [`ClaimEmbeddingPage::next`] is the last claim read
-    /// when the page was full, and `None` at the end of the walk.
+    /// The page reads at most `limit` rows whose claim id this build reads
+    /// (clamped to `1..=`[`CLAIM_EMBEDDING_PAGE_MAX_CLAIMS`]) in ascending
+    /// claim-id order after the cursor. [`ClaimEmbeddingPage::next`] is the
+    /// last claim read when the page was full, and `None` at the end of the
+    /// walk.
+    ///
+    /// A backend that can hold a row whose claim id this build refuses (one
+    /// written past the store, by a later build with a wider id alphabet)
+    /// counts it in [`ClaimEmbeddingPage::undecodable`] and reads past it,
+    /// and does not count it toward `limit`, so `next` is always a claim id
+    /// and such a row can neither end the walk early nor fail it.
     ///
     /// The classifications are how a caller keeps a class of claims from
     /// ever reaching its embedder: a claim outside the set is not answered.
