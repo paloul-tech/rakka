@@ -93,9 +93,17 @@ pub fn agent_durable_span_identity(
 /// Link-kind value: the parked `checkpoint-open` span a resolution resumes
 /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
 pub const LINK_KIND_PARKED_CHECKPOINT: &str = "parked-checkpoint";
-/// Link-kind value: the incoming human or service request span whose command
-/// resolved a checkpoint ([17.11](../../../docs/plans/rakka-agent/spec.md)).
+/// Link-kind value: the incoming request, exchange or timer span that caused
+/// a resume: the human or service request whose command resolved a
+/// checkpoint ([17.11](../../../docs/plans/rakka-agent/spec.md)), or the
+/// child's result, the relay's workflow result or the scheduler's deadline
+/// that resolved a child wait ([17.5](../../../docs/plans/rakka-agent/spec.md),
+/// issue #70).
 pub const LINK_KIND_RESUME_REQUEST: &str = "resume-request";
+/// Link-kind value: the parked `wait` span a child wait's resolution ends,
+/// linked by the identity both derive from the run's context and the fan-in
+/// group ([17.5](../../../docs/plans/rakka-agent/spec.md), issue #70).
+pub const LINK_KIND_PARKED_WAIT: &str = "parked-wait";
 /// Link-kind value: the dispatch attempt whose outcome could not be
 /// established ([17.9](../../../docs/plans/rakka-agent/spec.md)).
 pub const LINK_KIND_AMBIGUOUS_ATTEMPT: &str = "ambiguous-attempt";
@@ -146,6 +154,7 @@ pub fn agent_linked_telemetry_context(
 pub const AGENT_TELEMETRY_LINK_KINDS: &[&str] = &[
     crate::effect::LINK_KIND_SUPERSEDED_GENERATION,
     LINK_KIND_PARKED_CHECKPOINT,
+    LINK_KIND_PARKED_WAIT,
     LINK_KIND_RESUME_REQUEST,
     LINK_KIND_AMBIGUOUS_ATTEMPT,
     LINK_KIND_RECONCILIATION_DECISION,

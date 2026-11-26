@@ -279,6 +279,66 @@ async fn create_workflow_task(fixture: &Fixture) {
         .expect("the goal task should create");
 }
 
+/// The trace context a traced task is created under, so the run's segments
+/// carry durable span identities (issue #70).
+const INGRESS_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+/// The span a host's relay or scheduler sends a command under.
+const RELAY_PARENT: &str = "00-4ef7651916cd43dd8448eb211c80319a-f7ad6b7169203335-01";
+
+fn trace_context(trace_parent: &str) -> rakka_agent_workflow::AgentTelemetryContext {
+    rakka_agent_workflow::AgentTelemetryContext {
+        trace_parent: Some(trace_parent.to_string()),
+        ..rakka_agent_workflow::AgentTelemetryContext::default()
+    }
+}
+
+/// `command`, a task creation, under the ingress trace context.
+fn traced_creation(
+    mut command: rakka_agent::AgentTaskEntityCommand,
+) -> rakka_agent::AgentTaskEntityCommand {
+    if let rakka_agent::AgentTaskEntityCommand::Create { creation, .. } = &mut command {
+        creation.telemetry = trace_context(INGRESS_PARENT);
+    }
+    command
+}
+
+/// [`create_workflow_task`] under the ingress trace context.
+async fn create_workflow_task_traced(fixture: &Fixture) {
+    fixture.instantiate_agent().await;
+    fixture
+        .apply_task_command(traced_creation(goal_task_creation_command(
+            task_definition(),
+            goal_spec_draft(goal_spec_with_workflow(None), true),
+        )))
+        .await
+        .expect("the goal task should create");
+}
+
+/// The segments of one class the sink holds, in the order they closed.
+fn segments_of(
+    sink: &rakka_agent::InMemoryAgentSegmentSink,
+    label: &str,
+) -> Vec<rakka_agent::AgentTelemetrySegment> {
+    sink.segments()
+        .into_iter()
+        .filter(|segment| segment.operation.as_label() == label)
+        .collect()
+}
+
+/// The span id of the link of `kind` a segment carries.
+fn linked_span<'a>(segment: &'a rakka_agent::AgentTelemetrySegment, kind: &str) -> Option<&'a str> {
+    segment
+        .telemetry
+        .span_links
+        .iter()
+        .find(|link| {
+            link.attributes
+                .get(rakka_agent::ATTR_AGENT_TELEMETRY_LINK_KIND)
+                == Some(&kind.to_string())
+        })
+        .map(|link| link.span_id.as_str())
+}
+
 async fn parked_phase(fixture: &Fixture) -> (AgentLoopPhase, Option<AgentRunStatus>, usize) {
     let mut run = fixture.run();
     run.recover(fixture.now()).await.expect("recover");
@@ -1822,11 +1882,14 @@ async fn parked_beside_a_fan_in_wait_observed(
     let space = rakka_agent::KnowledgeSpaceId::new("space-alpha").expect("the space id is valid");
     let mut spec = goal_spec_with_workflow(None);
     spec.knowledge_spaces.insert(space.clone());
+    // Traced, so the child wait's segments carry identities (issue #70).
+    // A trace context moves no state: the world's other proofs are as they
+    // were.
     fixture
-        .apply_task_command(goal_task_creation_command(
+        .apply_task_command(traced_creation(goal_task_creation_command(
             task_definition(),
             goal_spec_draft(spec, true),
-        ))
+        )))
         .await
         .expect("the goal task should create");
     fixture.pump().await.expect("the loop should converge");
@@ -4437,6 +4500,148 @@ async fn a_wait_resolved_on_a_parked_run_closes_no_resume_segment() {
             ),
             "the answer takes the run on to its next wait: {closed:?}"
         );
+    }
+}
+
+/// Issue #70: a workflow child's result, relayed under the host's span,
+/// resolves the wait the run was parked on. That transition closes one
+/// `wait-resolve`, linking the park and the relay's span.
+#[tokio::test]
+async fn a_workflow_childs_result_resolves_the_wait_and_links_its_relay() {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    )
+    .with_segments(sink.clone());
+    create_workflow_task_traced(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+    assert_eq!(rest_of(&fixture).await.0, AgentLoopPhase::AwaitingChildren);
+    let (invocation, _) = committed_invocation(&fixture).await;
+
+    let command = AgentRunEntityCommand::record_workflow_result(
+        &TenantId::new(TENANT),
+        invocation.clone(),
+        child_workflow_run_id(&invocation),
+        AgentWorkflowTerminalStatus::Completed,
+        None,
+        None,
+        Some(rakka_agent::AgentContentDigest::sha256_of_bytes(b"result")),
+    )
+    .expect("the command derives")
+    .with_telemetry(trace_context(RELAY_PARENT));
+    apply_to_run(&fixture, command).await;
+
+    let resolves = segments_of(&sink, "wait-resolve");
+    assert_eq!(resolves.len(), 1, "{:?}", sink.operations());
+    let wait = &segments_of(&sink, "wait")[0];
+    assert!(wait.span_id.is_some(), "a traced park has an identity");
+    assert_eq!(
+        linked_span(&resolves[0], rakka_agent::LINK_KIND_PARKED_WAIT),
+        wait.span_id.as_deref()
+    );
+    assert_eq!(
+        linked_span(&resolves[0], rakka_agent::LINK_KIND_RESUME_REQUEST),
+        RELAY_PARENT.split('-').nth(2)
+    );
+}
+
+/// Issue #70: a wait resolved while a reconciliation park holds the run
+/// closes `wait-resolve`, linking the park, though the run does not go on
+/// (`a_wait_resolved_on_a_parked_run_closes_no_resume_segment` holds the
+/// `run-resume` half). No later answer could link it: by then the run is no
+/// longer parked on the group.
+#[tokio::test]
+async fn a_group_resolved_under_a_reconciliation_park_closes_wait_resolve() {
+    for resolver in ["the deadline", "the child's report"] {
+        let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+        let (fixture, _append) =
+            parked_beside_a_fan_in_wait_observed(None, Some(sink.clone()), false).await;
+        assert_eq!(segments_of(&sink, "wait").len(), 1, "{resolver}: one park");
+        assert!(segments_of(&sink, "wait-resolve").is_empty());
+
+        if resolver == "the deadline" {
+            fire_the_deadline(&fixture).await;
+        } else {
+            the_child_reports(&fixture).await;
+        }
+
+        let resolves = segments_of(&sink, "wait-resolve");
+        assert_eq!(resolves.len(), 1, "{resolver}: {:?}", sink.operations());
+        assert_eq!(
+            linked_span(&resolves[0], rakka_agent::LINK_KIND_PARKED_WAIT),
+            segments_of(&sink, "wait")[0].span_id.as_deref(),
+            "{resolver}"
+        );
+    }
+}
+
+/// Issue #70: a cancelled parent's last workflow child reports, and the
+/// wind-down completes. The result resolves the wait, so `wait-resolve`
+/// closes; the run has ended, so `run-resume` closes too, and carries the
+/// same two links.
+#[tokio::test]
+async fn a_cancelled_parents_last_child_closes_both_with_the_same_links() {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        workflow_await_turn(),
+    )
+    .with_segments(sink.clone());
+    create_workflow_task_traced(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+    let (invocation, _) = committed_invocation(&fixture).await;
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::Cancel {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, "parent-cancel", "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator-cancelled".to_string(),
+        },
+    )
+    .await;
+    let resumes_before = segments_of(&sink, "run-resume").len();
+
+    let command = AgentRunEntityCommand::record_workflow_result(
+        &TenantId::new(TENANT),
+        invocation.clone(),
+        child_workflow_run_id(&invocation),
+        AgentWorkflowTerminalStatus::Completed,
+        None,
+        None,
+        Some(rakka_agent::AgentContentDigest::sha256_of_bytes(b"result")),
+    )
+    .expect("the command derives")
+    .with_telemetry(trace_context(RELAY_PARENT));
+    apply_to_run(&fixture, command).await;
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert!(
+        run.state()
+            .expect("state")
+            .status()
+            .is_some_and(|status| status.is_terminal()),
+        "the last child's report ends the wind-down"
+    );
+    let resolves = segments_of(&sink, "wait-resolve");
+    assert_eq!(resolves.len(), 1, "{:?}", sink.operations());
+    let resumes = segments_of(&sink, "run-resume");
+    assert_eq!(resumes.len(), resumes_before + 1, "{:?}", sink.operations());
+    let resume = resumes.last().expect("the resume");
+    for kind in [
+        rakka_agent::LINK_KIND_PARKED_WAIT,
+        rakka_agent::LINK_KIND_RESUME_REQUEST,
+    ] {
+        assert_eq!(
+            linked_span(resume, kind),
+            linked_span(&resolves[0], kind),
+            "run-resume carries the resolution's {kind} link"
+        );
+        assert!(linked_span(resume, kind).is_some(), "{kind}");
     }
 }
 
