@@ -139,6 +139,7 @@ async fn a_fan_in_deadline_with_no_group_answers_unchanged_and_writes_nothing() 
     let reply = run
         .apply(
             AgentRunEntityCommand::FireFanInDeadline {
+                telemetry: Default::default(),
                 operation_id: timer_id("fan-in"),
             },
             &fx.router,

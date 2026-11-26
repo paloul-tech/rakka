@@ -1913,6 +1913,7 @@ async fn fire_the_deadline(fixture: &Fixture) -> rakka_agent::AgentRunEntityRepl
     apply_to_run(
         fixture,
         AgentRunEntityCommand::FireFanInDeadline {
+            telemetry: Default::default(),
             operation_id: rakka_agent::AgentOperationId::new(
                 rakka_agent::AgentOperationKind::Command,
                 [TENANT, "fan-in-deadline", "1"],

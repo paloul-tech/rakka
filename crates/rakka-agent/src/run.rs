@@ -9100,7 +9100,7 @@ where
                 })
                 .await?
             }
-            AgentRunEntityCommand::FireFanInDeadline { operation_id } => {
+            AgentRunEntityCommand::FireFanInDeadline { operation_id, .. } => {
                 if let Some(unchanged) = self.unchanged_by(fire_fan_in_deadline, now)? {
                     return Ok(unchanged);
                 }
@@ -9118,6 +9118,7 @@ where
                 terminal_reason,
                 result_ref,
                 result_digest,
+                ..
             } => {
                 let reply = self
                     .transition(now, records_decision, move |state| {
@@ -10754,6 +10755,15 @@ pub enum AgentRunEntityCommand {
     FireFanInDeadline {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
+        /// The trace context of the host's span that sent this command, for
+        /// the `resume-request` link of the `wait-resolve` segment the command
+        /// closes when it ends the run's child wait (issue #70,
+        /// [specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+        /// Observability only: it is never persisted and no transition reads
+        /// it. A command encoded before this field decodes to the empty
+        /// context. Set it with [`Self::with_telemetry`].
+        #[serde(default)]
+        telemetry: AgentTelemetryContext,
     },
     /// One child workflow run's terminal outcome, recorded on the invocation
     /// cell that owns it
@@ -10819,6 +10829,15 @@ pub enum AgentRunEntityCommand {
         /// Content digest of the child's result, when one exists.
         #[serde(default)]
         result_digest: Option<crate::task::AgentContentDigest>,
+        /// The trace context of the host's span that sent this command, for
+        /// the `resume-request` link of the `wait-resolve` segment the command
+        /// closes when it ends the run's child wait (issue #70,
+        /// [specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+        /// Observability only: it is never persisted and no transition reads
+        /// it. A command encoded before this field decodes to the empty
+        /// context. Set it with [`Self::with_telemetry`].
+        #[serde(default)]
+        telemetry: AgentTelemetryContext,
     },
     /// Request cancellation of the run.
     Cancel {
@@ -10895,7 +10914,7 @@ impl AgentRunEntityCommand {
             | Self::ResolveIndeterminateEffect { operation_id, .. }
             | Self::ResolveCheckpoint { operation_id, .. }
             | Self::FireCheckpointTimers { operation_id }
-            | Self::FireFanInDeadline { operation_id }
+            | Self::FireFanInDeadline { operation_id, .. }
             | Self::RecordWorkflowResult { operation_id, .. }
             | Self::Cancel { operation_id, .. }
             | Self::PromoteMemory { operation_id, .. }
@@ -10905,9 +10924,32 @@ impl AgentRunEntityCommand {
         }
     }
 
+    /// This command with `telemetry` as the trace context it carries, when it
+    /// is one of the two commands that can end a run's child wait from
+    /// outside the run: [`Self::RecordWorkflowResult`] and
+    /// [`Self::FireFanInDeadline`]. Every other command is returned
+    /// unchanged. The context is admitted through
+    /// [`crate::observability::sanitize_agent_telemetry_context`].
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        match &mut self {
+            Self::RecordWorkflowResult {
+                telemetry: carried, ..
+            }
+            | Self::FireFanInDeadline {
+                telemetry: carried, ..
+            } => {
+                *carried = crate::observability::sanitize_agent_telemetry_context(telemetry);
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Builds one child workflow run's result command with its derived
     /// operation id, so the relay cannot mis-derive the identity every
-    /// re-drive must share.
+    /// re-drive must share. It carries no trace context; set one with
+    /// [`Self::with_telemetry`].
     #[allow(clippy::too_many_arguments)]
     pub fn record_workflow_result(
         tenant: &TenantId,
@@ -10927,6 +10969,7 @@ impl AgentRunEntityCommand {
             terminal_reason,
             result_ref: result_ref.map(Box::new),
             result_digest,
+            telemetry: AgentTelemetryContext::default(),
         })
     }
 }

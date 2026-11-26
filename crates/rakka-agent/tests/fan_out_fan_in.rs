@@ -440,6 +440,7 @@ async fn the_deadline_marks_stragglers_and_resolves_timed_out() {
     assert_eq!(phase, AgentLoopPhase::AwaitingChildren);
 
     let fire = |suffix: &'static str| AgentRunEntityCommand::FireFanInDeadline {
+        telemetry: Default::default(),
         operation_id: rakka_agent::AgentOperationId::new(
             rakka_agent::AgentOperationKind::Command,
             [TENANT, "fan-in-deadline", suffix],
@@ -795,6 +796,7 @@ async fn a_deadline_resolution_is_counted_like_a_result_resolution() {
         .clock
         .store(10_000, std::sync::atomic::Ordering::SeqCst);
     let fire = |suffix: &'static str| AgentRunEntityCommand::FireFanInDeadline {
+        telemetry: Default::default(),
         operation_id: rakka_agent::AgentOperationId::new(
             rakka_agent::AgentOperationKind::Command,
             [TENANT, "fan-in-deadline", suffix],
