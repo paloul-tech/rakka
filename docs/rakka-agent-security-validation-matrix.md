@@ -395,14 +395,14 @@ frozen byte for byte, against the current schema:
 | No statement bytes remain in any row after a tombstone, or after a delete | `postgres_tombstone_leaves_no_statement_bytes_when_dsn_is_set`, `postgres_delete_leaves_no_statement_bytes_when_dsn_is_set` |
 | An earlier binary's in-flight transition cannot write a statement back over a stub, or over a deleted claim | `postgres_an_earlier_transition_statement_cannot_write_over_a_stub_when_dsn_is_set`, `postgres_an_earlier_transition_statement_against_a_deleted_claim_applies_nothing_when_dsn_is_set` |
 | An earlier binary's replayed append cannot restore a deleted claim | `postgres_an_earlier_binary_replaying_an_erased_append_cannot_restore_it_when_dsn_is_set` |
-| A tombstone or delete racing a transition ends in one of the two serial outcomes | `postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_set`, `postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set` |
+| A tombstone or delete racing a transition ends as the writer that reached the claim's row first left it; both orders are forced on every run | `postgres_a_tombstone_and_a_transition_queued_on_one_claim_end_as_they_queued_when_dsn_is_set`, `postgres_a_delete_and_a_transition_queued_on_one_claim_end_as_they_queued_when_dsn_is_set` |
 | A stale delete writes nothing | `postgres_a_stale_delete_writes_nothing_when_dsn_is_set` |
 | A duplicate append that waited on the original cannot restore a claim deleted meanwhile | `postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_waited_when_dsn_is_set` |
 | An operation id in flight for another claim is a conflict, and the second claim is untouched | `postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when_dsn_is_set` |
 | The wider ledger check is validated without blocking a writer | `postgres_the_migration_validates_its_wider_check_without_blocking_writers_when_dsn_is_set` |
 | Concurrent migrators all succeed on the upgrade path | `postgres_concurrent_migrators_upgrade_the_earlier_schema_when_dsn_is_set` |
 | A stub row's columns agree with its record, except the fence value, and drift is refused | `postgres_a_stub_row_holds_markers_and_the_fence_when_dsn_is_set` |
-| Two callers racing the same operation both get its one result | `postgres_same_operation_races_converge_every_time_when_dsn_is_set` |
+| Two callers racing the same operation both get its one result, whether the second is queued behind the first's write or stopped between an erasure's two reads | `postgres_a_same_operation_racer_queued_behind_the_winner_answers_its_result_when_dsn_is_set`, `postgres_a_same_operation_racer_stopped_between_its_two_reads_answers_the_winners_result_when_dsn_is_set` |
 
 Keyword search (issue #69) is one more clause of the same suite, run only by
 a backend that reports the `keyword-search` capability, and a second file of
@@ -448,13 +448,13 @@ The sweep's own handling of a damaged claim is held on the in-memory store
 by `crates/rakka-agent-knowledge-graph/tests/retention_damaged_history.rs`,
 through a store that answers as a damaged backend does.
 
-Verified on 2026-11-20 against PostgreSQL 16.14 with pgvector 0.8.5, with
+Verified on 2026-11-25 against PostgreSQL 16.14 with pgvector 0.8.5, with
 `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1`: the graph crate's seven test files pass
-with no skips (8 backend proofs, 32 conformance clauses, 16 damaged-history
-proofs, 16 erasure proofs, 1 migration-lock proof, 27 search-index proofs, 12
+with no skips (9 backend proofs, 32 conformance clauses, 16 damaged-history
+proofs, 17 erasure proofs, 1 migration-lock proof, 28 search-index proofs, 13
 semantic-search proofs). Against PostgreSQL 17.5, which has no pgvector, the
-same files pass, and eleven tests of meaning-based search announce that they
-did not run: nine semantic-search proofs and two conformance clauses.
+same files pass, and twelve tests of meaning-based search announce that they
+did not run: ten semantic-search proofs and two conformance clauses.
 
 ## Repeatable commands
 
