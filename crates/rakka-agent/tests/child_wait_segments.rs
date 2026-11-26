@@ -188,7 +188,7 @@ async fn a_turn_awaiting_two_children_parks_one_wait_segment() {
     );
     let (group, run_context) = group_and_context(&fixture).await;
     let identity = group
-        .parked_span_identity(&run_context)
+        .parked_span_identity(&run_scope(), &run_context)
         .expect("a traced run derives the park's identity");
     assert_eq!(wait.span_id.as_deref(), Some(identity.span_id.as_str()));
     assert!(closed(&sink, "wait-resolve").is_empty());
@@ -323,9 +323,53 @@ async fn the_last_childs_result_resolves_the_wait_and_links_the_park_and_the_chi
     );
 }
 
+/// Delivers one exchange through a facade of its own and returns its reply.
+async fn deliver_reply(
+    fixture: &Fixture,
+    envelope: &AgentExchangeEnvelope,
+) -> rakka_agent::AgentExchangeReply {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.accept(envelope, &fixture.router, fixture.now())
+        .await
+        .expect("the delivery is answered")
+}
+
+/// Ages the run's exchange journal past its window by record surgery, as
+/// `forget_operations` does for a command log, rather than 64 other
+/// exchanges: a delivery after this one is not answered from the journal,
+/// so its transition runs again.
+async fn forget_exchanges(fixture: &Fixture) {
+    use rakka_persistence::DurableStateStore;
+    let id = run_scope().persistence_id();
+    let record = fixture
+        .runs
+        .load(&id)
+        .await
+        .expect("the store loads")
+        .expect("the record exists");
+    let mut encoded = serde_json::to_value(&record.state).expect("the state encodes");
+    let journal = encoded
+        .get_mut("journal")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the run state has an exchange journal");
+    assert!(
+        journal.contains_key("applied"),
+        "the journal has a window to forget"
+    );
+    journal.insert("applied".to_string(), serde_json::json!([]));
+    let state = serde_json::from_value(encoded).expect("the rewritten state decodes");
+    fixture
+        .runs
+        .compare_and_set(&id, record.revision, state)
+        .await
+        .expect("the rewrite lands");
+}
+
 /// A duplicate of the result that resolved the group resolves nothing more,
-/// in the journal's window or past it, where a conflicting duplicate re-runs
-/// the transition: the run is no longer parked on the group.
+/// in the journal's window, where the journal answers it, and past it, where
+/// its transition runs again and the first writer wins: either way the run
+/// is no longer parked on the group (plan Review Focus item 4).
 #[tokio::test]
 async fn a_duplicate_result_resolves_nothing() {
     let sink = Arc::new(InMemoryAgentSegmentSink::new());
@@ -338,18 +382,17 @@ async fn a_duplicate_result_resolves_nothing() {
     deliver(&fixture, &second)
         .await
         .expect("the second result is taken");
-    deliver(&fixture, &second)
-        .await
-        .expect("the duplicate is answered");
-    // A conflicting duplicate under the same operation id re-runs the
-    // transition, and the first writer wins.
-    let conflicting = child_result_envelope(
-        &fixture,
-        &children[1].0,
-        &children[1].1,
-        AgentTaskStatus::Cancelled,
+    assert_eq!(closed(&sink, "wait-resolve").len(), 1);
+
+    let in_window = deliver_reply(&fixture, &second).await;
+    assert!(in_window.is_replayed(), "the journal answers it");
+
+    forget_exchanges(&fixture).await;
+    let past_window = deliver_reply(&fixture, &second).await;
+    assert!(
+        !past_window.is_replayed(),
+        "past the window the transition runs again: {past_window:?}"
     );
-    let _ = deliver(&fixture, &conflicting).await;
     fixture.pump().await.expect("the loop should converge");
     assert_eq!(
         closed(&sink, "wait-resolve").len(),
@@ -508,4 +551,113 @@ async fn a_resolution_whose_settle_pass_fails_still_closes_wait_resolve() {
         "the re-driven run is no longer parked: {:?}",
         sink.operations()
     );
+}
+
+/// Review I1: a parked run is cancelled, and its children refuse the
+/// cancel. Settling that reply is the commit that ends the run, and so its
+/// wait on the group: it closes `wait-resolve`, linking the park, as the
+/// `run-resume` the cancel closes does.
+#[tokio::test]
+async fn a_parked_run_ended_by_its_childrens_refused_cancel_closes_wait_resolve() {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fixture = parked_fan_out(&sink).await;
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, "parent-cancel", "1"],
+            )
+            .expect("the operation id derives"),
+            reason: "operator-cancelled".to_string(),
+        },
+        &fixture.router,
+        fixture.now(),
+    )
+    .await
+    .expect("the cancellation applies");
+    fixture.pump().await.expect("the loop should converge");
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert!(
+        run.state()
+            .expect("state")
+            .status()
+            .is_some_and(|status| status.is_terminal()),
+        "the refused cancels end the run"
+    );
+    let wait = &closed(&sink, "wait")[0];
+    let resolves = closed(&sink, "wait-resolve");
+    assert_eq!(resolves.len(), 1, "{:?}", sink.operations());
+    assert_eq!(
+        link_of(&resolves[0], LINK_KIND_PARKED_WAIT).map(|link| link.span_id.as_str()),
+        wait.span_id.as_deref(),
+        "the resolution links the park it ended"
+    );
+    let resume = closed(&sink, "run-resume");
+    let resume = resume.last().expect("the ended run closes run-resume");
+    assert_eq!(
+        link_of(resume, LINK_KIND_PARKED_WAIT).map(|link| link.span_id.as_str()),
+        wait.span_id.as_deref(),
+        "and run-resume agrees with it"
+    );
+}
+
+/// Review I2: a turn that awaits members an earlier turn delegated. The
+/// await call's turn rests on the children in a crank step, which closes
+/// the run's one `wait`.
+#[tokio::test]
+async fn an_await_in_a_later_turn_parks_in_a_crank_step() {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let delegate = |id: &str, skill: &str| {
+        AgentToolCallRequest::new(
+            AgentToolCallId::new(id).expect("call id"),
+            delegation_tool_id(),
+            serde_json::json!({ "skill": skill, "input": { "text": "hello" } }),
+        )
+        .expect("the tool call is bounded")
+    };
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(
+                    1,
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Fanning out now, awaiting later.")
+                        .with_tool_call(delegate("delegate-1", SKILL))
+                        .with_tool_call(delegate("delegate-2", SKILL_2)),
+                )
+                .with_turn_for(
+                    2,
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Now awaiting both.")
+                        .with_tool_call(
+                            AgentToolCallRequest::new(
+                                AgentToolCallId::new("await-1").expect("call id"),
+                                fan_in_tool_id(),
+                                serde_json::json!({}),
+                            )
+                            .expect("the tool call is bounded"),
+                        ),
+                )
+                .with_turn_for(3, proposing_turn()),
+        )
+        .with_a2a_send_executor(SkillNamedExecutor::new()),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_segments(sink.clone());
+    create_fan_out_task_traced(&fixture, None, context(INGRESS_PARENT)).await;
+    fixture.pump().await.expect("the loop should converge");
+    assert_eq!(phase_of(&fixture).await, AgentLoopPhase::AwaitingChildren);
+
+    let waits = closed(&sink, "wait");
+    assert_eq!(waits.len(), 1, "{:?}", sink.operations());
+    let (group, run_context) = group_and_context(&fixture).await;
+    assert_eq!(group.opened_turn, 1, "the group opened in the first turn");
+    let identity = group
+        .parked_span_identity(&run_scope(), &run_context)
+        .expect("a traced run derives the park's identity");
+    assert_eq!(waits[0].span_id.as_deref(), Some(identity.span_id.as_str()));
 }

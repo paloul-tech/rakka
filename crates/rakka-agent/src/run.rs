@@ -8800,8 +8800,9 @@ where
             .ok()
             .and_then(AgentRunState::loop_state)
             .and_then(|loop_state| {
-                parked_group(loop_state)
-                    .map(|group| parked_wait_links(loop_state, group, command.trigger_telemetry()))
+                parked_group(loop_state).map(|group| {
+                    parked_wait_links(self.scope(), loop_state, group, command.trigger_telemetry())
+                })
             });
         self.resolving = resolving
             .as_ref()
@@ -9462,7 +9463,15 @@ where
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
             let decisions = self.flush_decision_events(now).await?;
+            // Settling a reply commits a transition of its own: the children's
+            // refusals of a parked run's cancel can end it, and so its wait
+            // (issue #70). No exchange arriving here caused it, so the
+            // resolution links the park alone.
+            let parked_before = self.parked_group_now();
+            let settle_timer = AgentSegmentTimer::start(now);
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
+            self.close_wait_park(parked_before, now);
+            self.close_wait_resolve(parked_before, None, settle_timer);
 
             progress.transitions += advanced + cancels;
             progress.effects_dispatched += dispatched;
@@ -10182,8 +10191,8 @@ where
     /// [specification 17.4](../../../docs/plans/rakka-agent/spec.md)).
     ///
     /// The segment ends at the durable park, as `checkpoint-open` does, and
-    /// exports under the identity derived from the run's context and the
-    /// group ([`crate::fan_in::AgentFanInCell::parked_span_identity`]), so the
+    /// exports under the identity derived from the run's context, the run and
+    /// the group ([`crate::fan_in::AgentFanInCell::parked_span_identity`]), so the
     /// transition that resolves the group links to it without either storing
     /// it.
     fn close_wait_park(
@@ -10212,7 +10221,7 @@ where
             })
             .attribute(SEGMENT_ATTR_WAIT_KIND, AGENT_WAIT_KIND_CHILDREN)
             .attribute(SEGMENT_ATTR_FAN_IN_POLICY, group.policy.as_label());
-        if let Some(identity) = group.parked_span_identity(loop_state.telemetry()) {
+        if let Some(identity) = group.parked_span_identity(self.scope(), loop_state.telemetry()) {
             segment = segment.span_id(identity.span_id);
         }
         self.close_segment(segment.ok());
@@ -10257,7 +10266,7 @@ where
         {
             segment = segment.attribute(SEGMENT_ATTR_FAN_IN_RESOLUTION, resolution.code.clone());
         }
-        let links = parked_wait_links(loop_state, before, trigger);
+        let links = parked_wait_links(self.scope(), loop_state, before, trigger);
         self.close_segment_under(segment.ok(), loop_state.telemetry().clone(), links);
     }
 
@@ -11896,9 +11905,10 @@ fn parked_group(loop_state: &AgentLoopState) -> Option<(u64, AgentTimestampMilli
 /// The links a resolution of the child wait on `group` carries
 /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md), issue
 /// #70): the parked `wait` span, by the identity the park derived from the
-/// run's context and the group, and the span of the request, exchange or
+/// run's context, the run and the group, and the span of the request, exchange or
 /// timer that caused it, when `trigger` holds a valid trace context.
 fn parked_wait_links(
+    run: &AgentRunScope,
     loop_state: &AgentLoopState,
     group: (u64, AgentTimestampMillis),
     trigger: Option<&AgentTelemetryContext>,
@@ -11907,7 +11917,7 @@ fn parked_wait_links(
     if let Some(parked) = loop_state
         .fan_in()
         .filter(|cell| (cell.opened_turn, cell.opened_at) == group)
-        .and_then(|cell| cell.parked_span_identity(loop_state.telemetry()))
+        .and_then(|cell| cell.parked_span_identity(run, loop_state.telemetry()))
     {
         links.push(agent_span_link(&parked, LINK_KIND_PARKED_WAIT));
     }

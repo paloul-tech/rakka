@@ -391,17 +391,17 @@ Built on branch `child-wait-segments`, in five planned tasks plus one fix
 ### 9.1 Measured
 
 The same hook logged every segment the crate's tests close, before the change
-and after it (`cargo test -p rakka-agent --all-features`, 2,061 tests passed
-after):
+and after it (`cargo test -p rakka-agent --all-features --no-fail-fast`,
+2,063 tests passed after, measured again after the final review's fixes):
 
 | | Before | After |
 | --- | --- | --- |
-| `run-resume` | 24, in 21 tests | 27, in 24 tests |
-| `wait` | 0 | 18, in 15 tests |
-| `wait-resolve` | 0 | 14, in 11 tests |
+| `run-resume` | 24, in 21 tests | 28, in 25 tests |
+| `wait` | 0 | 20, in 17 tests |
+| `wait-resolve` | 0 | 15, in 12 tests |
 
 The per-test `run-resume` lines are identical for every test that existed
-before. The three extra are tests this branch added, each a run that ends.
+before. The four extra are tests this branch added, each a run that ends.
 Every other segment class is also unchanged for those tests, so section 3's
 last anti-goal holds. Of the new segments, 4 `wait` and 4 `wait-resolve` come
 from three earlier tests in `workflow_tool.rs`, whose runs already wired a
@@ -411,12 +411,21 @@ sink.
 
 Parks and resolutions are found where 5.2 said: after a command's own arm
 (before `note_committed_transition` and the settle pass), around the host's
-acceptance of an exchange, and at each crank step. Every park the tests reach
-commits in a command arm: a send's or start's result, and
-`FireCheckpointTimers`. Resolutions commit there and in the exchange path, for
-a child's result. No test parks or resolves in a crank step, and none could be
-found that would. The checks stay on all three paths, because the rule is
-"every committed transition".
+acceptance of an exchange, and at each crank step. The final review found a
+fourth commit the build had missed: the settle pass's settlement of a reply
+(`drive_pending_exchanges`). A parked run whose children refuse its cancel
+ends there, and that ended its wait with no `wait-resolve`, while the
+cancel's `run-resume` linked the park. The park and the resolution are now
+checked around it too, with no trigger. Every other commit in `run.rs` was
+searched and can neither park nor resolve: the session-memory and
+decision-event flushes, the workflow-cancel commits, and the effect dispatch.
+
+Parks commit in a command arm (a send's or start's result, and
+`FireCheckpointTimers`) and in a crank step: an await called in a later turn
+than its delegations rests the turn there. The builder said no crank park
+existed; the review found this one. Resolutions commit in a command arm, in
+an exchange's acceptance (a child's result) and in a reply's settlement. No
+crank-step resolution was found for records this build writes.
 
 One gap was found by the whole-crate run and not by any task's tests. Task 3
 added the three attribute keys to `AGENT_SPAN_ATTRIBUTE_KEYS` but not to the
@@ -432,7 +441,7 @@ is fixed in its own commit.
 | The first child's result | `::a_result_that_leaves_the_group_open_parks_nothing_more` |
 | The second child's result, traced | `::the_last_childs_result_resolves_the_wait_and_links_the_park_and_the_child` |
 | Passivated between park and result | the same test: each delivery is taken by a facade of its own, recovered from the store |
-| A duplicate or replayed result | `::a_duplicate_result_resolves_nothing` (in the journal's window, and a conflicting duplicate that re-runs the transition) |
+| A duplicate or replayed result | `::a_duplicate_result_resolves_nothing` (in the journal's window, where the journal answers it, and past it, where record surgery has aged the journal and the transition runs again) |
 | `FireFanInDeadline`, with and without a context | `::the_deadline_resolves_the_wait_and_links_its_timer_when_given_one` |
 | `RecordWorkflowResult` | `workflow_tool.rs::a_workflow_childs_result_resolves_the_wait_and_links_its_relay` |
 | A member's send fails and resolves the group in a crank step | **dropped as unreachable** (9.4) |
@@ -442,6 +451,9 @@ is fixed in its own commit.
 | A handoff wait | `handoff_record.rs::a_handoff_wait_parks_no_wait_segment` |
 | No trace context | `child_wait_segments.rs::a_run_with_no_trace_context_still_parks`, `::a_run_with_no_trace_context_resolves_without_a_park_link` |
 | JSON for both commands without `telemetry` | `::commands_without_a_trace_context_decode_to_an_empty_one`, which also shows an unknown key is ignored, as an older build ignores `telemetry` |
+
+After the final review: `::an_await_in_a_later_turn_parks_in_a_crank_step`
+and `::a_parked_run_ended_by_its_childrens_refused_cancel_closes_wait_resolve`.
 
 Also added: `::a_resolution_whose_settle_pass_fails_still_closes_wait_resolve`
 (the crank's first write after the resolution loses, the call answers an
@@ -455,8 +467,11 @@ the command-arm park check skipped (4), the "not parked on G before" check
 dropped from the park (1) and from the resolution (10), a resolution closed
 while G is open (7), the exchange passing no trigger (2), `run-resume`
 without the park links (1), and `deny_unknown_fields` on the command enum
-(1). Skipping the crank or the exchange park check fails nothing, which is
-9.2's finding.
+(1). After the review: skipping the crank's park check fails the later-turn
+await test, dropping the settlement's resolution check fails the refused-cancel
+test, and dropping the run from the identity fails the unit test's "another run
+is another park". Skipping the exchange's park check fails nothing: no
+exchange's acceptance parks a run.
 
 ### 9.4 Rulings made while building
 
@@ -485,7 +500,31 @@ without the park links (1), and `deny_unknown_fields` on the command enum
   handoff test in `handoff_record.rs`, beside the gate and handoff helpers
   they use.
 - **The Collector allowlist fix** is 9.2's gap, fixed in its own commit.
+- **The park's identity includes the run** (the final review, against 5.3).
+  5.3's material, `["wait", "children", opened_turn, opened_at]`, gives two
+  runs one span id when a host creates several tasks inside one request, so
+  they share its trace context, and both open a group in the same turn and
+  millisecond. The material is now
+  `["wait", "children", <the run scope's key>, opened_turn, opened_at]`. No
+  build had shipped the old one, so nothing derives it.
 - **The Assignment arm** (5.8) is drafted as an issue in
   `tmp/2026-11-26-assignment-records-context-on-refusal.md`, not filed. Reading
   the choreography host showed a second path to the same write: the same
   generation re-sent past the journal window.
+
+### 9.5 Left open after the final review
+
+Four minor findings were deferred, not filed:
+
+- `run-resume`'s park links are read once, before `apply_unboxed`'s
+  stale-refusal and `Unchanged` re-reads. A command answered against the
+  re-read record takes `wait-resolve` from fresh marks and `run-resume`'s
+  links from the stale cache.
+- `wait-resolve` closes with no `rakka.agent.fan_in.resolution` when a run
+  ends with its group unresolved. After an older build's `needs_turn_reopen`
+  repair, a second `wait` exports under the same span id.
+- The commands' context is sanitized when it is set (`with_telemetry`), not
+  where it is read, so a command decoded from the wire skips it. This is
+  harmless: the link takes validated ids only.
+- Plan Review Focus item 2, the stale-refusal retry, is sound by reading and
+  has no `conflict_from` test.

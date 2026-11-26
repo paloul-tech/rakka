@@ -322,9 +322,14 @@ pub struct AgentFanInCell {
 }
 
 impl AgentFanInCell {
-    /// The durable span identity of the `wait` segment that parked a run on
-    /// this group, derived from the run's trace context and the group's own
-    /// identity: the turn and the time it was opened at.
+    /// The durable span identity of the `wait` segment that parked `run` on
+    /// this group, derived from the run's trace context, the run, and the
+    /// group's own identity: the turn and the time it was opened at.
+    ///
+    /// The run is in the material because a trace context is not one run's:
+    /// a host that creates several tasks inside one request hands every run
+    /// the same context, and two of them can open a group in the same turn
+    /// and millisecond.
     ///
     /// Stored nowhere. The park and the transition that resolves the group
     /// both derive it, and agree because neither input moves in between: a
@@ -335,6 +340,7 @@ impl AgentFanInCell {
     #[must_use]
     pub fn parked_span_identity(
         &self,
+        run: &crate::identity::AgentRunScope,
         run_context: &rakka_agent_workflow::AgentTelemetryContext,
     ) -> Option<rakka_agent_workflow::AgentTraceContext> {
         crate::observability::agent_durable_span_identity(
@@ -342,6 +348,7 @@ impl AgentFanInCell {
             &[
                 "wait",
                 crate::observability::AGENT_WAIT_KIND_CHILDREN,
+                &run.key(),
                 &self.opened_turn.to_string(),
                 &self.opened_at.as_millis().to_string(),
             ],
@@ -723,10 +730,10 @@ mod tests {
             AgentTimestampMillis::new(40),
         );
         let identity = cell
-            .parked_span_identity(&traced())
+            .parked_span_identity(&scope(), &traced())
             .expect("a traced run derives an identity");
         assert_eq!(
-            cell.parked_span_identity(&traced()),
+            cell.parked_span_identity(&scope(), &traced()),
             Some(identity.clone()),
             "the park and the resolution derive the same identity"
         );
@@ -737,15 +744,31 @@ mod tests {
         for other in [later_turn, later_time] {
             assert_ne!(
                 other
-                    .parked_span_identity(&traced())
+                    .parked_span_identity(&scope(), &traced())
                     .expect("identity")
                     .span_id,
                 identity.span_id,
                 "another group is another park"
             );
         }
+        // Two runs a host created inside one request share its trace
+        // context, and fan out in the same turn and millisecond under a
+        // coarse clock: they are two parks, not one span id twice.
+        let other_run = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("coordinator").expect("agent id"),
+            AgentRunId::new("run-2").expect("run id"),
+        )
+        .expect("run scope");
+        assert_ne!(
+            cell.parked_span_identity(&other_run, &traced())
+                .expect("identity")
+                .span_id,
+            identity.span_id,
+            "another run is another park"
+        );
         assert_eq!(
-            cell.parked_span_identity(&AgentTelemetryContext::default()),
+            cell.parked_span_identity(&scope(), &AgentTelemetryContext::default()),
             None,
             "a run with no trace context derives none"
         );

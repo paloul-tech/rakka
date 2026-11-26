@@ -234,7 +234,7 @@ a resume link back to the operation that parked.
 | `checkpoint-resolve` | Checkpoint resolution — the transition an incoming human or service decision commits (17.11's resolution span) |
 | `run-resume`, `run-recover` | Run resume/recovery |
 | `wait` | A run parked on its children: the commit after which it waits on its fan-in group (17.4's park; no 17.6 row) |
-| `wait-resolve` | The transition that ends that wait, a child's result, a workflow result or the deadline (17.4's resume; no 17.6 row) |
+| `wait-resolve` | The transition that ends that wait: a child's result, a workflow result, the deadline, or the run's end (17.4's resume; no 17.6 row) |
 
 A `run-resume` segment is closed by a command applied to a run that finds it
 on a wait of its phase, and whose pass leaves it ended or with nothing
@@ -329,7 +329,7 @@ link to a span the other closes — before it closes. Four records carry one:
 | `effect-dispatch` (one attempt) | the effect's context, effect id, generation, attempt | nothing — re-derived by whoever links to it |
 | `checkpoint-open` | the gated effect's context and the checkpoint id | `AgentCheckpoint::telemetry`, at open |
 | `checkpoint-resolve` | the gated effect's context and the checkpoint id | nothing — named forward by the park, re-derived at resolution |
-| `wait` (a child wait's park) | the run's context and the fan-in group's turn and timestamp (`AgentFanInCell::parked_span_identity`) | nothing — re-derived by the transition that resolves the group |
+| `wait` (a child wait's park) | the run's context, the run, and the fan-in group's turn and timestamp (`AgentFanInCell::parked_span_identity`) | nothing — re-derived by the transition that resolves the group |
 
 Every span link carries one attribute, `rakka.agent.link.kind`, and its
 values are a bounded vocabulary held as data in `AGENT_TELEMETRY_LINK_KINDS`,
