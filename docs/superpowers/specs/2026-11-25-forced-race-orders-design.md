@@ -123,8 +123,16 @@ distinctive statement strings, as the loops did.
 
 ### 5.3 Same operation, two sessions
 
-Two proofs replace the 64-run loop:
+Three proofs replace the 64-run loop (the third added after the review; see
+section 7):
 
+- **Stopped at its first read.** For each of transition, tombstone and
+  delete, in a private schema: the holder locks the claim table
+  (`ACCESS EXCLUSIVE`), so one session's write-start read waits before it
+  takes its snapshot; the holder runs the same request inside its
+  transaction and commits. The waiting caller then sees the ledger row and
+  the claim together and answers the holder's result. Asserted: the two
+  answers are equal.
 - **Queued at the write.** For each of transition, tombstone and delete:
   both sessions run the same request, queued in order on the held row. The
   second's fenced write matches nothing, and it answers from the ledger the
@@ -163,6 +171,7 @@ about, reverted after. The break must fail the proof on every run:
 | `DELETE_SQL` without its fence | delete, transition queued first |
 | `WRITE_START_SQL` without its ledger join, so a retry sees no ledger row | same operation queued at the write |
 | An erasure that treats a moved claim as damaged instead of reading again | same operation between the two reads |
+| `write_start` split into a ledger read and then a claim read (the shape the #68 design's 12.3 fixed) | same operation stopped at its first read |
 | `APPEND_SQL`'s ledger insert with `ON CONFLICT DO NOTHING` again | duplicate append |
 | `TOMBSTONE_SQL`'s and `DELETE_SQL`'s ledger insert with `ON CONFLICT DO NOTHING` | operation id in flight for another claim |
 
@@ -189,9 +198,27 @@ the queue order holds.
 - The two 48-run loops and the 64-run loop are removed, not kept. With 5.2,
   5.3 and the damaged-history proof, every interleaving they could reach is
   forced somewhere, and a loop whose branches are asserted elsewhere cannot
-  fail for a reason of its own.
+  fail for a reason of its own. As first built, this was true only of the
+  interleavings today's code has: see section 7.
 - One proof per erasure, each running both orders, rather than one proof
   per order. It keeps the file's existing shape (one proof per race).
 - The helpers are copied into this file rather than shared. Test files in
   the crate share no module today, and adding one changes nothing a reader
   needs.
+
+## 7. After the whole-branch review
+
+One fresh reviewer read the branch at `5c78f533`: no critical finding, one
+important, five minor. The builder re-graded one minor to important.
+
+| Finding | Fix | Proof |
+| --- | --- | --- |
+| Removing the 64-run loop removed the only proof that fails if `write_start` reads the ledger and the claim in two statements again (the #68 design's 12.3 defect). Section 6's claim held only for today's one-statement read: neither new same-operation proof stops a caller before that read. With the read split, the branch's suite passed and the base's loop failed, ten runs of ten. | A third same-operation proof stops the caller at its first read (5.3). | `postgres_a_same_operation_racer_stopped_at_its_first_read_answers_the_winners_result_when_dsn_is_set`: against a split read it failed 6 runs of 6 (3 per database), every operation refused as 12.3 describes, while the other 17 proofs passed; against the branch it passed 20 runs of 20 on each database. |
+| **Re-graded from minor.** The matrix row "ends as the writer that reached the claim's row first left it" is false when the transition reaches the row first: the race ends with a stub, or no claim, once the erasure reads again. | The row says the race ends as if the two had run one after the other, in the order they reached the row. | Docs only. |
+
+Deferred minors, not fixed: the between-reads proof checks that the racer
+is blocked by the holder, not that it is at its history read; a writer that
+fails or finishes at once costs the full poll bound before the proof says
+so; the bound is about 16 seconds as measured, not ten, and the diagnostic
+labels an idle session's last statement "running"; a failed run's schema
+name is not printed.

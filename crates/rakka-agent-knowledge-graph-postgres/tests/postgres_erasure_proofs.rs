@@ -2024,6 +2024,144 @@ async fn postgres_a_same_operation_racer_stopped_between_its_two_reads_answers_t
     drop_world(world).await;
 }
 
+/// Two callers send the same operation, and the second is stopped at its
+/// first read (issue #136). Every write starts by reading its operation's
+/// ledger row and the claim in one statement (`WRITE_START_SQL`). The claim
+/// table is locked from the holder's session, so that statement waits before
+/// it takes its snapshot. The holder's session then runs the same request
+/// inside its transaction and commits, and the waiting caller's read sees
+/// both the ledger row and the claim the holder left: it answers the
+/// holder's result.
+///
+/// Read in two statements, the ledger first, a caller stopped between them
+/// would see no ledger row and then a claim its own operation had already
+/// moved, and refuse a request it should answer: the defect section 12.3 of
+/// the #68 design records. This is the proof that fails if the read is ever
+/// split again. All three operations are run before anything is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_same_operation_racer_stopped_at_its_first_read_answers_the_winners_result_when_dsn_is_set(
+) {
+    let Some(world) = lock_world("first_read_same_op").await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-first-read-same-op").primary;
+    let lock_claims = "BEGIN; LOCK TABLE rakka_agent_knowledge_claim IN ACCESS EXCLUSIVE MODE";
+    let mut disagreements = Vec::new();
+
+    let moved = conformance_claim(&scope, "moved", "node-a", "node-b");
+    world
+        .first
+        .store
+        .append(&scope, &moved)
+        .await
+        .expect("the claim appends");
+    let dispute = transition_request(
+        &scope,
+        &moved.claim_id,
+        "dispute",
+        ClaimTrustStatus::Disputed,
+    );
+    world
+        .holder
+        .client
+        .batch_execute(lock_claims)
+        .await
+        .expect("the claim table is locked");
+    let waiting = tokio::spawn(transition_on(&world.first.store, &scope, &dispute));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    let winner = world
+        .holder
+        .store
+        .transition(&scope, &dispute, &ClaimPromotionPolicy::ungated(), NOW)
+        .await
+        .expect("the transition lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    match waiting
+        .await
+        .expect("the waiting transition does not panic")
+    {
+        Ok(answered) if answered == winner => {}
+        other => disagreements.push(format!("transition: the waiting caller answered {other:?}")),
+    }
+
+    let withdrawn = conformance_claim(&scope, "withdrawn", "node-a", "node-c");
+    world
+        .first
+        .store
+        .append(&scope, &withdrawn)
+        .await
+        .expect("the claim appends");
+    let tombstone = tombstone_request(&scope, &withdrawn.claim_id, "withdraw");
+    world
+        .holder
+        .client
+        .batch_execute(lock_claims)
+        .await
+        .expect("the claim table is locked");
+    let waiting = tokio::spawn(tombstone_on(&world.first.store, &scope, &tombstone));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    let winner = world
+        .holder
+        .store
+        .tombstone(&scope, &tombstone)
+        .await
+        .expect("the tombstone lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    match waiting.await.expect("the waiting tombstone does not panic") {
+        Ok(answered) if answered == winner => {}
+        other => disagreements.push(format!("tombstone: the waiting caller answered {other:?}")),
+    }
+
+    let erased = conformance_claim(&scope, "erased", "node-a", "node-d");
+    world
+        .first
+        .store
+        .append(&scope, &erased)
+        .await
+        .expect("the claim appends");
+    let delete = delete_request(&scope, &erased.claim_id, "erase", None);
+    world
+        .holder
+        .client
+        .batch_execute(lock_claims)
+        .await
+        .expect("the claim table is locked");
+    let waiting = tokio::spawn(delete_on(&world.first.store, &scope, &delete));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    world
+        .holder
+        .store
+        .delete(&scope, &delete)
+        .await
+        .expect("the delete lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    if let Err(error) = waiting.await.expect("the waiting delete does not panic") {
+        disagreements.push(format!("delete: the waiting caller answered {error}"));
+    }
+
+    assert_eq!(
+        disagreements,
+        Vec::<String>::new(),
+        "a racer stopped at its first read answers the winner's result"
+    );
+    drop_world(world).await;
+}
+
 /// Whether the ledger's kind check is validated, when the check exists.
 async fn kind_check_validated(client: &Client) -> Option<bool> {
     client
