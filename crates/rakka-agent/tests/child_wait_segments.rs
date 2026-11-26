@@ -89,8 +89,21 @@ fn commands_without_a_trace_context_decode_to_an_empty_one() {
             "the key is written: {encoded}"
         );
         let decoded: AgentRunEntityCommand =
-            serde_json::from_value(encoded).expect("the command decodes");
+            serde_json::from_value(encoded.clone()).expect("the command decodes");
         assert_eq!(decoded, traced);
+
+        // What an older build does with `telemetry`: a key its variant does
+        // not declare is ignored, here another one this build does not know.
+        let mut newer = encoded;
+        newer
+            .as_object_mut()
+            .and_then(|tagged| tagged.values_mut().next())
+            .and_then(|body| body.as_object_mut())
+            .expect("an externally tagged struct variant")
+            .insert("from_a_newer_build".to_string(), serde_json::json!(1));
+        let tolerated: AgentRunEntityCommand =
+            serde_json::from_value(newer).expect("an unknown key is ignored");
+        assert_eq!(tolerated, traced);
     }
 }
 

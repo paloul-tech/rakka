@@ -233,6 +233,8 @@ a resume link back to the operation that parked.
 | `checkpoint-open` | Checkpoint open |
 | `checkpoint-resolve` | Checkpoint resolution — the transition an incoming human or service decision commits (17.11's resolution span) |
 | `run-resume`, `run-recover` | Run resume/recovery |
+| `wait` | A run parked on its children: the commit after which it waits on its fan-in group (17.4's park; no 17.6 row) |
+| `wait-resolve` | The transition that ends that wait, a child's result, a workflow result or the deadline (17.4's resume; no 17.6 row) |
 
 A `run-resume` segment is closed by a command applied to a run that finds it
 on a wait of its phase, and whose pass leaves it ended or with nothing
@@ -252,7 +254,15 @@ parked while it stands on its proposal, one that also asks for a top-up, and
 one that is winding down are held by more than the park. A wind-down the
 command's own transition began holds the run as well, so an answer that
 schedules a compensation closes none. An exchange delivered to the run
-closes none.
+closes none. When a command closes `run-resume` for a run it found parked on
+its children, the segment also carries the two links of that wait's
+resolution, `parked-wait` and `resume-request`; a request the checkpoint
+resolution already linked is not linked twice.
+
+`wait` and `wait-resolve` have no 17.6 row either way: they are 17.4's park
+and resume of a child wait (issue #70), mapped to `rakka.agent.run.wait` and
+`rakka.agent.run.wait.resolve`, both `INTERNAL`. Model, tool, handoff,
+checkpoint and wake waits close neither.
 
 Two rows of 17.6 are absent because the operations do not exist: `embeddings
 {model}` and `plan {agent.name}`. 17.6 asks for the planning span "only when
@@ -265,7 +275,7 @@ milestones; the emission is not, and this is the list rather than a silence.
 
 | Closed by | Classes |
 | --- | --- |
-| The run entity | `decide`, `invoke-agent`, `effect-schedule`, `checkpoint-open`, `checkpoint-resolve`, `run-resume`, `run-recover` |
+| The run entity | `decide`, `invoke-agent`, `effect-schedule`, `checkpoint-open`, `checkpoint-resolve`, `wait`, `wait-resolve`, `run-resume`, `run-recover` |
 | The dispatcher | `tool-authorize`, `effect-dispatch`, `model-inference`, `execute-tool` |
 | The A2A service | `a2a-ingress` |
 
@@ -312,13 +322,14 @@ that id verbatim. An identity is derived, never drawn
 (`agent_durable_span_identity`): a hash of the trace context a durable record
 already holds and the record's own identity, so two components holding the
 same record derive the same id without a message between them, and one can
-link to a span the other closes — before it closes. Three records carry one:
+link to a span the other closes — before it closes. Four records carry one:
 
 | Segment | Identity derived from | Stored on |
 | --- | --- | --- |
 | `effect-dispatch` (one attempt) | the effect's context, effect id, generation, attempt | nothing — re-derived by whoever links to it |
 | `checkpoint-open` | the gated effect's context and the checkpoint id | `AgentCheckpoint::telemetry`, at open |
 | `checkpoint-resolve` | the gated effect's context and the checkpoint id | nothing — named forward by the park, re-derived at resolution |
+| `wait` (a child wait's park) | the run's context and the fan-in group's turn and timestamp (`AgentFanInCell::parked_span_identity`) | nothing — re-derived by the transition that resolves the group |
 
 Every span link carries one attribute, `rakka.agent.link.kind`, and its
 values are a bounded vocabulary held as data in `AGENT_TELEMETRY_LINK_KINDS`,
@@ -329,9 +340,19 @@ checked against the writers in both directions by
 | --- | --- | --- |
 | `superseded-generation` | a regenerated effect's context | the generation it replaced |
 | `parked-checkpoint` | `checkpoint-resolve`, and the `run-resume` the same command discharged | the `checkpoint-open` span that parked |
-| `resume-request` | `checkpoint-resolve`, and that `run-resume` | the incoming request's span, from the resolving command's `telemetry` |
+| `parked-wait` | `wait-resolve`, and the `run-resume` the same command closed | the `wait` span that parked the run on its children |
+| `resume-request` | `checkpoint-resolve`, `wait-resolve`, and the `run-resume` the same command closed | the span that caused the resume: the incoming request's, from the resolving command's `telemetry`; for a child wait, the child's result envelope, or the `telemetry` of `RecordWorkflowResult` or `FireFanInDeadline` when the relay or the scheduler sets one |
 | `ambiguous-attempt` | the dispatcher's indeterminate `effect-dispatch` close, and the run's reconciliation `checkpoint-open` | the attempt whose outcome could not be established |
 | `reconciliation-decision` | the same two segments | the `checkpoint-resolve` span of the decision the run now waits for — linked forward |
+
+**A link can point at a span nobody exported.** A `parked-wait` link names
+the identity the park derived, and no span was exported under it when the
+park was committed by a build from before issue #70, while no segment sink was
+wired, or under a run context that a later `Assignment` rewrote. A tail
+sampler that drops the park span has the same effect, routinely. A link to an
+absent span is valid OpenTelemetry; read it as a park the backend does not
+hold, not as an error. Storing the identity would remove only the first of
+these causes, so it is derived.
 
 `error.type` is a bounded vocabulary, held as data in
 `AGENT_SEGMENT_ERROR_TYPES` and checked against the call sites in both

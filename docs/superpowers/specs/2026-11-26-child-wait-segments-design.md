@@ -382,3 +382,110 @@ proof must fail:
 - The test file layout, one concern per file.
 - Any exhaustive `AgentSegmentOperation` list the compiler or the mapping
   tests point to.
+
+## 9. As built
+
+Built on branch `child-wait-segments`, in five planned tasks plus one fix
+(`docs/superpowers/plans/2026-11-26-child-wait-segments.md`).
+
+### 9.1 Measured
+
+The same hook logged every segment the crate's tests close, before the change
+and after it (`cargo test -p rakka-agent --all-features`, 2,061 tests passed
+after):
+
+| | Before | After |
+| --- | --- | --- |
+| `run-resume` | 24, in 21 tests | 27, in 24 tests |
+| `wait` | 0 | 18, in 15 tests |
+| `wait-resolve` | 0 | 14, in 11 tests |
+
+The per-test `run-resume` lines are identical for every test that existed
+before. The three extra are tests this branch added, each a run that ends.
+Every other segment class is also unchanged for those tests, so section 3's
+last anti-goal holds. Of the new segments, 4 `wait` and 4 `wait-resolve` come
+from three earlier tests in `workflow_tool.rs`, whose runs already wired a
+sink.
+
+### 9.2 Where the rule runs
+
+Parks and resolutions are found where 5.2 said: after a command's own arm
+(before `note_committed_transition` and the settle pass), around the host's
+acceptance of an exchange, and at each crank step. Every park the tests reach
+commits in a command arm: a send's or start's result, and
+`FireCheckpointTimers`. Resolutions commit there and in the exchange path, for
+a child's result. No test parks or resolves in a crank step, and none could be
+found that would. The checks stay on all three paths, because the rule is
+"every committed transition".
+
+One gap was found by the whole-crate run and not by any task's tests. Task 3
+added the three attribute keys to `AGENT_SPAN_ATTRIBUTE_KEYS` but not to the
+gateway Collector's allowlist, which `collector_allowlist.rs` holds to that
+list in both directions. A deployment's Collector would have deleted them. It
+is fixed in its own commit.
+
+### 9.3 Section 6, row by row
+
+| Case | Test |
+| --- | --- |
+| Two delegations under `All` park one `wait` | `child_wait_segments.rs::a_turn_awaiting_two_children_parks_one_wait_segment` |
+| The first child's result | `::a_result_that_leaves_the_group_open_parks_nothing_more` |
+| The second child's result, traced | `::the_last_childs_result_resolves_the_wait_and_links_the_park_and_the_child` |
+| Passivated between park and result | the same test: each delivery is taken by a facade of its own, recovered from the store |
+| A duplicate or replayed result | `::a_duplicate_result_resolves_nothing` (in the journal's window, and a conflicting duplicate that re-runs the transition) |
+| `FireFanInDeadline`, with and without a context | `::the_deadline_resolves_the_wait_and_links_its_timer_when_given_one` |
+| `RecordWorkflowResult` | `workflow_tool.rs::a_workflow_childs_result_resolves_the_wait_and_links_its_relay` |
+| A member's send fails and resolves the group in a crank step | **dropped as unreachable** (9.4) |
+| A group resolved under a reconciliation park | `workflow_tool.rs::a_group_resolved_under_a_reconciliation_park_closes_wait_resolve` (the deadline and the child's report) |
+| An expired approval rests the turn on its children | `workflow_tool.rs::an_expired_approval_on_a_members_start_parks_through_the_timer` (two gated workflow starts: one granted, one expired) |
+| A cancelled parent's last workflow child | `workflow_tool.rs::a_cancelled_parents_last_child_closes_both_with_the_same_links` |
+| A handoff wait | `handoff_record.rs::a_handoff_wait_parks_no_wait_segment` |
+| No trace context | `child_wait_segments.rs::a_run_with_no_trace_context_still_parks`, `::a_run_with_no_trace_context_resolves_without_a_park_link` |
+| JSON for both commands without `telemetry` | `::commands_without_a_trace_context_decode_to_an_empty_one`, which also shows an unknown key is ignored, as an older build ignores `telemetry` |
+
+Also added: `::a_resolution_whose_settle_pass_fails_still_closes_wait_resolve`
+(the crank's first write after the resolution loses, the call answers an
+error, `wait-resolve` has closed once, and the re-driven run closes no
+second), `::a_trace_context_is_set_only_on_the_two_child_wait_commands`, and
+`otel_span_mapping.rs::the_child_wait_classes_map_to_the_run_wait_spans`.
+
+Every guard in section 6's falsification list was broken and restored, and
+its proof failed: a resolution identity from `opened_turn + 1` (4 tests),
+the command-arm park check skipped (4), the "not parked on G before" check
+dropped from the park (1) and from the resolution (10), a resolution closed
+while G is open (7), the exchange passing no trigger (2), `run-resume`
+without the park links (1), and `deny_unknown_fields` on the command enum
+(1). Skipping the crank or the exchange park check fails nothing, which is
+9.2's finding.
+
+### 9.4 Rulings made while building
+
+- **No `checkpoint-resolve` can also end a child wait** (plan Review Focus
+  item 1). A member's send or start gate is a turn effect, and a turn rests
+  on its children only once its effects have settled: the timer test shows
+  the run at `AwaitingTools` while the second gate waits. So a gate's
+  decision comes before the park: it can cause one, never resolve one. No
+  test was written; `run-resume` still dedups its links by trace and span id.
+  If wrong, a `run-resume` could carry `resume-request` twice, untested.
+- **The crank-step resolution row is dropped.** A parked run's sends and
+  starts have all settled, so no crank step resolves its group. If wrong, it
+  closes `wait-resolve` with `parked-wait` only, as designed, untested.
+- **The comparison reads only the parked group,** a `Copy` pair, not the
+  whole marks, at the command and exchange points, to keep those futures
+  small (issue #162). The crank passes the marks' new `parked` field.
+- **Two methods, `close_wait_park` and `close_wait_resolve`,** not one
+  `close_wait_changes` over a shared struct, each called at the three points.
+  Task 3 built the park half alone, since a trigger parameter with no reader
+  is dead code under `clippy -D warnings`. `trigger_telemetry` landed with the
+  resolution, in Task 4.
+- **The reconciliation-park fixture in `workflow_tool.rs` creates its task
+  traced,** so its wait has an identity. A context moves no state; its other
+  three callers' proofs pass unchanged.
+- **Test placement.** The timer-park test is in `workflow_tool.rs` and the
+  handoff test in `handoff_record.rs`, beside the gate and handoff helpers
+  they use.
+- **The Collector allowlist fix** is 9.2's gap, fixed in its own commit.
+- **The Assignment arm** (5.8) is drafted as an issue in
+  `tmp/2026-11-26-assignment-records-context-on-refusal.md`, not filed. Reading
+  the choreography host showed a second path to the same write: the same
+  generation re-sent past the journal window.
