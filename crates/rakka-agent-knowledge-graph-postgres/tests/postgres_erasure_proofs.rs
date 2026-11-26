@@ -24,9 +24,9 @@ use rakka_agent_knowledge_graph::conformance::{
 use rakka_agent_knowledge_graph::{
     Claim, ClaimCursor, ClaimDeleteExpectation, ClaimDeleteRequest, ClaimFilter, ClaimId,
     ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate, ClaimPromotionPolicy,
-    ClaimProvenance, ClaimTombstoneReason, ClaimTombstoneRequest, ClaimTransitionCursor,
-    ClaimTransitionOutcome, ClaimTrustStatus, ClaimTrustTransition, ClaimTrustTransitionRequest,
-    KnowledgeGraphStore, KnowledgeSpaceScope, CLAIM_TOMBSTONE_MARKER,
+    ClaimProvenance, ClaimResult, ClaimTombstoneReason, ClaimTombstoneRequest,
+    ClaimTransitionCursor, ClaimTransitionOutcome, ClaimTrustStatus, ClaimTrustTransition,
+    ClaimTrustTransitionRequest, KnowledgeGraphStore, KnowledgeSpaceScope, CLAIM_TOMBSTONE_MARKER,
 };
 use rakka_agent_knowledge_graph_postgres::{
     PostgresKnowledgeGraphStore, MIGRATION_SQL, MIGRATION_VALIDATE_SQL,
@@ -35,6 +35,8 @@ use rakka_agent_knowledge_graph_postgres::{
 use rakka_agent_workflow::{
     AgentAttributes, AgentTimestampMillis, ArtifactKind, ArtifactRef, RedactionStatus,
 };
+use std::future::Future;
+use std::sync::Arc;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls, Row};
 
@@ -140,15 +142,6 @@ const EVIDENCE: &str = "evid-ocelot-3310";
 const STATEMENT_STRINGS: [&str; 4] = [SUBJECT, PREDICATE, OBJECT, EVIDENCE];
 
 const NOW: AgentTimestampMillis = AgentTimestampMillis::new(10);
-
-/// How many times the tombstone/transition race is run.
-const TOMBSTONE_RACE_RUNS: u32 = 48;
-
-/// How many times the delete/transition race is run.
-const DELETE_RACE_RUNS: u32 = 48;
-
-/// How many times each same-operation race is run.
-const SAME_OPERATION_RACE_RUNS: u32 = 64;
 
 async fn connect(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls)
@@ -452,6 +445,213 @@ async fn ledger_row(
     .await
     .expect("the ledger row reads")
     .map(|row| (row.get("kind"), row.get("result")))
+}
+
+/// A store on a session of its own, with that session's backend id.
+struct Session {
+    client: Arc<Client>,
+    store: PostgresKnowledgeGraphStore,
+    pid: i32,
+}
+
+/// A private schema for a proof that queues writers on a lock: three store
+/// sessions and one for looking.
+///
+/// Every other proof in this file migrates the shared schema when it starts,
+/// and a repeat migration takes a brief `SHARE` lock on the claim table. Such
+/// a request, queued ahead of a writer, could let two writers reach a row
+/// together once it is released, or keep a proof waiting on a migrator that
+/// waits on the proof. No other proof migrates or writes this schema, so the
+/// only locks in it are the proof's own.
+struct LockWorld {
+    dsn: String,
+    schema: String,
+    /// The session whose writer queues first.
+    first: Session,
+    /// The session whose writer queues second.
+    second: Session,
+    /// The session that holds the lock the writers queue on.
+    holder: Session,
+    observer: Client,
+}
+
+async fn session_in(dsn: &str, schema: &str) -> Session {
+    let client = Arc::new(client_in(dsn, schema).await);
+    let pid = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the session answers its backend id")
+        .get(0);
+    let store = PostgresKnowledgeGraphStore::from_shared_client(client.clone());
+    Session { client, store, pid }
+}
+
+/// A fresh private schema with the three sessions, migrated; `None` without a
+/// test database.
+async fn lock_world(label: &str) -> Option<LockWorld> {
+    let dsn = dsn()?;
+    let schema = unique_schema(label);
+    connect(&dsn)
+        .await
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("the private schema is created");
+    let first = session_in(&dsn, &schema).await;
+    first.store.migrate().await.expect("the schema applies");
+    let second = session_in(&dsn, &schema).await;
+    let holder = session_in(&dsn, &schema).await;
+    let observer = client_in(&dsn, &schema).await;
+    Some(LockWorld {
+        dsn,
+        schema,
+        first,
+        second,
+        holder,
+        observer,
+    })
+}
+
+/// Drops the world's schema. A proof that panics never reaches this, and
+/// leaves its schema behind.
+async fn drop_world(world: LockWorld) {
+    connect(&world.dsn)
+        .await
+        .batch_execute(&format!("DROP SCHEMA {} CASCADE", world.schema))
+        .await
+        .expect("the private schema is dropped");
+}
+
+/// Waits until session `waiter` is blocked by session `blocker`, as the
+/// database itself reports it. A proof goes on only from there, so it depends
+/// on no timing; the interval only paces the polls.
+async fn until_blocked_by(observer: &Client, waiter: i32, blocker: i32) {
+    for _ in 0..1_000 {
+        let blocked: bool = observer
+            .query_one(
+                "SELECT $2 = ANY(pg_blocking_pids($1))",
+                &[&waiter, &blocker],
+            )
+            .await
+            .expect("the lock view reads")
+            .get(0);
+        if blocked {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let seen = observer
+        .query_one(
+            "SELECT format('blocked by %s; %s / %s / %s; running: %s', \
+                           pg_blocking_pids($1)::TEXT, state, wait_event_type, wait_event, \
+                           left(query, 120)) \
+             FROM pg_stat_activity WHERE pid = $1",
+            &[&waiter],
+        )
+        .await
+        .map(|row| row.get::<_, String>(0))
+        .unwrap_or_else(|error| format!("the activity view did not read: {error}"));
+    panic!("session {waiter} was never blocked by session {blocker} ({seen})");
+}
+
+/// Opens a transaction on `holder` that holds the claim's row, until `COMMIT`.
+async fn hold_claim_row(holder: &Client, scope: &KnowledgeSpaceScope, claim_id: &ClaimId) {
+    holder
+        .batch_execute("BEGIN")
+        .await
+        .expect("the transaction opens");
+    let held = holder
+        .query(
+            "SELECT 1 FROM rakka_agent_knowledge_claim \
+             WHERE tenant = $1 AND space = $2 AND claim_id = $3 FOR UPDATE",
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &claim_id.as_str(),
+            ],
+        )
+        .await
+        .expect("the claim row locks");
+    assert_eq!(held.len(), 1, "the holder holds the claim's row");
+}
+
+/// Runs two writers of one claim so that both read it before either writes,
+/// and the one queued first writes first.
+///
+/// The holder holds the claim's row. `first`, which must run on
+/// `world.first`'s store, is started and waited for until the holder blocks
+/// it: it has read the claim and its write is waiting on the row, first in
+/// the row's queue. `second`, on `world.second`'s store, is started and waited
+/// for until `first` blocks it: it has read the same claim and its write
+/// waits behind `first`'s. The holder then commits. PostgreSQL lets `first`'s
+/// write go and `second`'s write wait until `first`'s commits, so `second`'s
+/// fenced write sees the state `first` left.
+async fn queued_in_order<A, B>(
+    world: &LockWorld,
+    scope: &KnowledgeSpaceScope,
+    claim_id: &ClaimId,
+    first: impl Future<Output = A> + Send + 'static,
+    second: impl Future<Output = B> + Send + 'static,
+) -> (A, B)
+where
+    A: Send + 'static,
+    B: Send + 'static,
+{
+    hold_claim_row(&world.holder.client, scope, claim_id).await;
+    let first = tokio::spawn(first);
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    let second = tokio::spawn(second);
+    until_blocked_by(&world.observer, world.second.pid, world.first.pid).await;
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder releases the row");
+    (
+        first.await.expect("the first writer does not panic"),
+        second.await.expect("the second writer does not panic"),
+    )
+}
+
+/// One transition through `store`, as a task can own it.
+fn transition_on(
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    request: &ClaimTrustTransitionRequest,
+) -> impl Future<Output = ClaimResult<ClaimTransitionOutcome>> + Send + 'static {
+    let (store, scope, request) = (store.clone(), scope.clone(), request.clone());
+    async move {
+        store
+            .transition(&scope, &request, &ClaimPromotionPolicy::ungated(), NOW)
+            .await
+    }
+}
+
+/// One tombstone through `store`, as a task can own it.
+fn tombstone_on(
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    request: &ClaimTombstoneRequest,
+) -> impl Future<Output = ClaimResult<Claim>> + Send + 'static {
+    let (store, scope, request) = (store.clone(), scope.clone(), request.clone());
+    async move { store.tombstone(&scope, &request).await }
+}
+
+/// One delete through `store`, as a task can own it.
+fn delete_on(
+    store: &PostgresKnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    request: &ClaimDeleteRequest,
+) -> impl Future<Output = ClaimResult<()>> + Send + 'static {
+    let (store, scope, request) = (store.clone(), scope.clone(), request.clone());
+    async move { store.delete(&scope, &request).await }
+}
+
+/// Which of two writers of one claim reaches its row first.
+#[derive(Debug, Clone, Copy)]
+enum Order {
+    TransitionFirst,
+    ErasureFirst,
 }
 
 /// The storage file of each of the three tables: a rewrite changes it.
@@ -1018,24 +1218,32 @@ async fn postgres_an_earlier_transition_statement_cannot_write_over_a_stub_when_
         .is_none());
 }
 
-#[tokio::test]
-async fn postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_set() {
-    // Two connections race a tombstone and a transition on one claim. Every
-    // run ends in one of the two serial outcomes, never a mixture: either the
-    // transition landed first and the stub lists it with its ledger row
-    // erased, or the tombstone landed first and the transition was refused.
-    // Either way the statement is in no row.
-    let Some(store_a) = store().await else { return };
-    let store_b = store().await.expect("a second connection opens");
-    let raw = client().await.expect("a raw connection opens");
-    let policy = ClaimPromotionPolicy::ungated();
-    let mut transition_first = 0_u32;
-    let mut tombstone_first = 0_u32;
-
-    for run in 0..TOMBSTONE_RACE_RUNS {
-        let scope = ConformanceScopes::unique("pg-race-tombstone").primary;
-        let claim = distinctive_claim(&scope, &format!("race-{run}"));
-        store_a
+/// A tombstone and a transition of one claim, queued on its row in each order
+/// (issue #136). Both read the claim before either writes; the row decides
+/// whose write lands first, and the other's fenced write then matches
+/// nothing, so it reads again and is judged against the state that won.
+///
+/// Transition first: the tombstone's second attempt finds one transition, and
+/// the stub lists it with its ledger row erased. Tombstone first: the
+/// transition's second attempt finds a stub and is refused. Either way the
+/// statement is in no row. Each order is asserted on every run.
+///
+/// The remaining order, a transition that lands between the tombstone's two
+/// reads, is forced by
+/// `postgres_a_transition_between_an_erasures_two_reads_is_a_race_when_dsn_is_set`
+/// in `postgres_damaged_history_proofs.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_tombstone_and_a_transition_queued_on_one_claim_end_as_they_queued_when_dsn_is_set(
+) {
+    let Some(world) = lock_world("queued_tombstone").await else {
+        return;
+    };
+    for order in [Order::TransitionFirst, Order::ErasureFirst] {
+        let scope = ConformanceScopes::unique("pg-queued-tombstone").primary;
+        let claim = distinctive_claim(&scope, "queued");
+        world
+            .first
+            .store
             .append(&scope, &claim)
             .await
             .expect("the claim appends");
@@ -1047,74 +1255,99 @@ async fn postgres_concurrent_tombstone_and_transition_stay_coherent_when_dsn_is_
         );
         let tombstone = tombstone_request(&scope, &claim.claim_id, "withdraw");
 
-        // A tombstone makes one more round trip than a transition before its
-        // write, so started together the transition always wins. Holding the
-        // transition back mixes the orders. The step is nominal: a runtime
-        // timer is far coarser than 40 microseconds, so each non-zero delay
-        // is really "up to about a millisecond, by timer phase". That is
-        // enough to produce both orders; neither is asserted to occur.
-        let head_start = std::time::Duration::from_micros(u64::from(run % 8) * 40);
-        let (tombstoned, transitioned) =
-            tokio::join!(store_a.tombstone(&scope, &tombstone), async {
-                tokio::time::sleep(head_start).await;
-                store_b.transition(&scope, &dispute, &policy, NOW).await
-            },);
-        let stub = tombstoned.expect("the tombstone always lands: it retries a lost race");
-        let history = store_a
-            .transitions(&scope, &claim.claim_id, ClaimTransitionCursor::start())
-            .await
-            .expect("the history lists");
-        let stored = store_a
+        let (transitioned, tombstoned) = match order {
+            Order::TransitionFirst => {
+                queued_in_order(
+                    &world,
+                    &scope,
+                    &claim.claim_id,
+                    transition_on(&world.first.store, &scope, &dispute),
+                    tombstone_on(&world.second.store, &scope, &tombstone),
+                )
+                .await
+            }
+            Order::ErasureFirst => {
+                let (tombstoned, transitioned) = queued_in_order(
+                    &world,
+                    &scope,
+                    &claim.claim_id,
+                    tombstone_on(&world.first.store, &scope, &tombstone),
+                    transition_on(&world.second.store, &scope, &dispute),
+                )
+                .await;
+                (transitioned, tombstoned)
+            }
+        };
+
+        let stub = tombstoned
+            .unwrap_or_else(|error| panic!("{order:?}: the tombstone always lands: {error}"));
+        let stored = world
+            .first
+            .store
             .get(&scope, &claim.claim_id)
             .await
-            .expect("the claim reads")
-            .expect("the stub exists");
-        assert_eq!(stored, stub);
-        assert!(stored.is_tombstoned());
+            .unwrap_or_else(|error| panic!("{order:?}: the claim reads: {error}"))
+            .unwrap_or_else(|| panic!("{order:?}: the stub exists"));
+        assert_eq!(
+            stored, stub,
+            "{order:?}: the stub read back is the one answered"
+        );
+        assert!(stored.is_tombstoned(), "{order:?}: the claim is a stub");
+        let history = world
+            .first
+            .store
+            .transitions(&scope, &claim.claim_id, ClaimTransitionCursor::start())
+            .await
+            .unwrap_or_else(|error| panic!("{order:?}: the history lists: {error}"));
+        let dispute_ledger = ledger_row(&world.observer, &scope, &dispute.operation_id).await;
 
-        match transitioned {
-            Ok(outcome) => {
-                transition_first += 1;
+        match order {
+            Order::TransitionFirst => {
+                let outcome = transitioned.unwrap_or_else(|error| {
+                    panic!("{order:?}: the transition queued first lands: {error}")
+                });
                 assert_eq!(outcome.claim.trust(), ClaimTrustStatus::Disputed);
+                assert_eq!(
+                    stored.trust(),
+                    ClaimTrustStatus::Disputed,
+                    "{order:?}: the stub keeps the trust the transition left"
+                );
+                assert_eq!(stored.transition_count(), 1, "{order:?}");
                 assert_eq!(
                     history.transitions.len(),
                     1,
-                    "the stub lists the transition"
+                    "{order:?}: the stub lists the transition"
                 );
-                assert_eq!(stored.trust(), ClaimTrustStatus::Disputed);
-                assert_eq!(stored.transition_count(), 1);
-                let (kind, result) = ledger_row(&raw, &scope, &dispute.operation_id)
-                    .await
-                    .expect("the transition's ledger row is kept");
                 assert_eq!(
-                    kind, "erased",
-                    "the tombstone erased the transition it followed"
+                    dispute_ledger,
+                    Some(("erased".to_string(), Vec::new())),
+                    "{order:?}: the tombstone erased the transition it followed"
                 );
-                assert!(result.is_empty());
             }
-            Err(error) => {
-                tombstone_first += 1;
+            Order::ErasureFirst => {
+                let error = transitioned.expect_err(&format!(
+                    "{order:?}: a transition queued behind the tombstone is refused"
+                ));
                 assert_eq!(
                     error.code(),
                     "claim-tombstoned",
-                    "a transition that lost to the tombstone is refused as such: {error}"
+                    "{order:?}: refused as a stub: {error}"
                 );
-                assert!(history.transitions.is_empty());
-                assert_eq!(stored.trust(), ClaimTrustStatus::Proposed);
-                assert!(ledger_row(&raw, &scope, &dispute.operation_id)
-                    .await
-                    .is_none());
+                assert_eq!(stored.trust(), ClaimTrustStatus::Proposed, "{order:?}");
+                assert!(history.transitions.is_empty(), "{order:?}: no history");
+                assert_eq!(
+                    dispute_ledger, None,
+                    "{order:?}: the refused transition spent no ledger row"
+                );
             }
         }
         assert_eq!(
-            statement_strings_in(&scope_rows(&raw, &scope).await),
+            statement_strings_in(&scope_rows(&world.observer, &scope).await),
             Vec::<&str>::new(),
-            "run {run}: the statement survives in no row, whichever writer won"
+            "{order:?}: the statement survives in no row"
         );
     }
-    eprintln!(
-        "tombstone/transition race: transition first {transition_first}, tombstone first {tombstone_first}"
-    );
+    drop_world(world).await;
 }
 
 #[tokio::test]
@@ -1372,24 +1605,38 @@ async fn postgres_an_earlier_transition_statement_against_a_deleted_claim_applie
     );
 }
 
-#[tokio::test]
-async fn postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set() {
-    // Two connections race a delete and a transition on one claim. Every run
-    // ends in one of the two serial outcomes: the transition landed first and
-    // the delete took it with the claim, its ledger row erased; or the delete
-    // landed first and the transition found no claim. Never a mixture — no
-    // orphaned transition row, no ledger row still holding the claim.
-    let Some(store_a) = store().await else { return };
-    let store_b = store().await.expect("a second connection opens");
-    let raw = client().await.expect("a raw connection opens");
-    let policy = ClaimPromotionPolicy::ungated();
-    let mut transition_first = 0_u32;
-    let mut delete_first = 0_u32;
-
-    for run in 0..DELETE_RACE_RUNS {
-        let scope = ConformanceScopes::unique("pg-race-delete").primary;
-        let claim = distinctive_claim(&scope, &format!("race-{run}"));
-        store_a
+/// A delete and a transition of one claim, queued on its row in each order
+/// (issue #136). Both read the claim before either writes; the row decides
+/// whose write lands first.
+///
+/// Transition first: the delete's fenced write matches nothing, and its
+/// second attempt takes the claim with its one transition and erases both
+/// operations' ledger rows. Delete first: the transition's write finds no
+/// row, and its second attempt finds no claim. Either way no claim or
+/// transition row is left and the statement is in no row. Each order is
+/// asserted on every run.
+///
+/// Delete first has no fence of its own to falsify: a deleted row matches no
+/// `UPDATE`, whatever its condition says. What it holds is that the
+/// transition then writes nothing — no orphaned transition row, no ledger
+/// row — and answers `claim-not-found`.
+///
+/// The remaining order, a transition that lands between the delete's two
+/// reads, is forced by
+/// `postgres_a_transition_between_an_erasures_two_reads_is_a_race_when_dsn_is_set`
+/// in `postgres_damaged_history_proofs.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_delete_and_a_transition_queued_on_one_claim_end_as_they_queued_when_dsn_is_set()
+{
+    let Some(world) = lock_world("queued_delete").await else {
+        return;
+    };
+    for order in [Order::TransitionFirst, Order::ErasureFirst] {
+        let scope = ConformanceScopes::unique("pg-queued-delete").primary;
+        let claim = distinctive_claim(&scope, "queued");
+        world
+            .first
+            .store
             .append(&scope, &claim)
             .await
             .expect("the claim appends");
@@ -1401,67 +1648,88 @@ async fn postgres_concurrent_delete_and_transition_stay_coherent_when_dsn_is_set
         );
         let delete = delete_request(&scope, &claim.claim_id, "erase", None);
 
-        // As in the tombstone race: the delete makes one more round trip
-        // before its write, so the transition is held back by a nominal step
-        // (coarsened by the runtime's timer) to mix the two orders.
-        let head_start = std::time::Duration::from_micros(u64::from(run % 8) * 40);
-        let (deleted, transitioned) = tokio::join!(store_a.delete(&scope, &delete), async {
-            tokio::time::sleep(head_start).await;
-            store_b.transition(&scope, &dispute, &policy, NOW).await
-        },);
-        deleted.expect("an unconditional delete always lands: it retries a lost race");
+        let (transitioned, deleted) = match order {
+            Order::TransitionFirst => {
+                queued_in_order(
+                    &world,
+                    &scope,
+                    &claim.claim_id,
+                    transition_on(&world.first.store, &scope, &dispute),
+                    delete_on(&world.second.store, &scope, &delete),
+                )
+                .await
+            }
+            Order::ErasureFirst => {
+                let (deleted, transitioned) = queued_in_order(
+                    &world,
+                    &scope,
+                    &claim.claim_id,
+                    delete_on(&world.first.store, &scope, &delete),
+                    transition_on(&world.second.store, &scope, &dispute),
+                )
+                .await;
+                (transitioned, deleted)
+            }
+        };
 
+        deleted.unwrap_or_else(|error| {
+            panic!("{order:?}: an unconditional delete always lands: {error}")
+        });
         assert!(
-            store_a
+            world
+                .first
+                .store
                 .get(&scope, &claim.claim_id)
                 .await
-                .expect("the read answers")
+                .unwrap_or_else(|error| panic!("{order:?}: the read answers: {error}"))
                 .is_none(),
-            "run {run}: the claim is gone"
+            "{order:?}: the claim is gone"
         );
-        let rows = scope_rows(&raw, &scope).await;
+        let rows = scope_rows(&world.observer, &scope).await;
         assert!(
             rows.iter().all(|row| row.starts_with(b"op|")),
-            "run {run}: no claim row and no transition row survives the delete"
+            "{order:?}: no claim row and no transition row survives the delete"
         );
         assert_eq!(
             statement_strings_in(&rows),
             Vec::<&str>::new(),
-            "run {run}: the statement survives in no row, whichever writer won"
+            "{order:?}: the statement survives in no row"
         );
-        let (kind, _) = ledger_row(&raw, &scope, &claim.operation_id)
+        let (kind, _) = ledger_row(&world.observer, &scope, &claim.operation_id)
             .await
             .expect("the append's ledger row is kept");
-        assert_eq!(kind, "erased");
+        assert_eq!(kind, "erased", "{order:?}: the append is erased");
+        let dispute_ledger = ledger_row(&world.observer, &scope, &dispute.operation_id).await;
 
-        match transitioned {
-            Ok(_) => {
-                transition_first += 1;
-                let (kind, result) = ledger_row(&raw, &scope, &dispute.operation_id)
-                    .await
-                    .expect("the transition's ledger row is kept");
+        match order {
+            Order::TransitionFirst => {
+                let outcome = transitioned.unwrap_or_else(|error| {
+                    panic!("{order:?}: the transition queued first lands: {error}")
+                });
+                assert_eq!(outcome.claim.trust(), ClaimTrustStatus::Disputed);
                 assert_eq!(
-                    kind, "erased",
-                    "run {run}: the delete erased the transition it followed"
+                    dispute_ledger,
+                    Some(("erased".to_string(), Vec::new())),
+                    "{order:?}: the delete erased the transition it followed"
                 );
-                assert!(result.is_empty());
             }
-            Err(error) => {
-                delete_first += 1;
+            Order::ErasureFirst => {
+                let error = transitioned.expect_err(&format!(
+                    "{order:?}: a transition queued behind the delete is refused"
+                ));
                 assert_eq!(
                     error.code(),
                     "claim-not-found",
-                    "run {run}: a transition that lost to the delete finds no claim: {error}"
+                    "{order:?}: it finds no claim: {error}"
                 );
-                assert!(ledger_row(&raw, &scope, &dispute.operation_id)
-                    .await
-                    .is_none());
+                assert_eq!(
+                    dispute_ledger, None,
+                    "{order:?}: the refused transition spent no ledger row"
+                );
             }
         }
     }
-    eprintln!(
-        "delete/transition race: transition first {transition_first}, delete first {delete_first}"
-    );
+    drop_world(world).await;
 }
 
 #[tokio::test]
@@ -1565,80 +1833,334 @@ async fn postgres_a_stale_delete_writes_nothing_when_dsn_is_set() {
     );
 }
 
-#[tokio::test]
-async fn postgres_same_operation_races_converge_every_time_when_dsn_is_set() {
-    // Two connections race the *same* operation id. Exactly one applies, and
-    // the other must answer the winner's result — not a refusal decided
-    // against the state the winner left behind. The window is the gap between
-    // a store reading the ledger and reading the claim: a racer that commits
-    // inside it leaves a ledger-less reader looking at a claim its own
-    // operation already moved. One read of both closes it; the runs hold the
-    // second racer back by a nominal step to land some of them in that window.
-    let Some(store_a) = store().await else { return };
-    let store_b = store().await.expect("a second connection opens");
-    let policy = ClaimPromotionPolicy::ungated();
+/// Two callers send the same operation, and the second's write is queued
+/// behind the first's on the claim's row (issue #136). Both read the claim,
+/// and no ledger row, before either writes. The first's write lands; the
+/// second's fenced write then matches nothing, and its next attempt finds
+/// the ledger row the first wrote and answers from it: the one outcome, the
+/// one stub, success twice. It must not judge the request again against the
+/// claim the first already moved, which would refuse it.
+///
+/// All three operations are run before anything is asserted, so a failure
+/// names every operation that disagreed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_same_operation_racer_queued_behind_the_winner_answers_its_result_when_dsn_is_set(
+) {
+    let Some(world) = lock_world("queued_same_op").await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-queued-same-op").primary;
+    let mut disagreements = Vec::new();
 
-    for run in 0..SAME_OPERATION_RACE_RUNS {
-        let head_start = std::time::Duration::from_micros(u64::from(run % 16) * 25);
-        let scope = ConformanceScopes::unique("pg-race-same-op").primary;
-
-        // The same transition: both racers answer the one applied outcome.
-        let moved = conformance_claim(&scope, &format!("moved-{run}"), "node-a", "node-b");
-        store_a
-            .append(&scope, &moved)
-            .await
-            .expect("the claim appends");
-        let dispute = transition_request(
-            &scope,
-            &moved.claim_id,
-            "dispute",
-            ClaimTrustStatus::Disputed,
-        );
-        let (first, second) =
-            tokio::join!(store_a.transition(&scope, &dispute, &policy, NOW), async {
-                tokio::time::sleep(head_start).await;
-                store_b.transition(&scope, &dispute, &policy, NOW).await
-            },);
-        let first = first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
-        let second = second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
-        assert_eq!(first, second, "run {run}: one transition, one outcome");
-
-        // The same tombstone: both racers answer the one stub.
-        let withdrawn = conformance_claim(&scope, &format!("withdrawn-{run}"), "node-a", "node-c");
-        store_a
-            .append(&scope, &withdrawn)
-            .await
-            .expect("the claim appends");
-        let tombstone = tombstone_request(&scope, &withdrawn.claim_id, "withdraw");
-        let (first, second) = tokio::join!(store_a.tombstone(&scope, &tombstone), async {
-            tokio::time::sleep(head_start).await;
-            store_b.tombstone(&scope, &tombstone).await
-        },);
-        let first = first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
-        let second = second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
-        assert_eq!(first, second, "run {run}: one tombstone, one stub");
-
-        // The same delete: both racers answer success.
-        let erased = conformance_claim(&scope, &format!("erased-{run}"), "node-a", "node-d");
-        store_a
-            .append(&scope, &erased)
-            .await
-            .expect("the claim appends");
-        let delete = delete_request(&scope, &erased.claim_id, "erase", None);
-        let (first, second) = tokio::join!(store_a.delete(&scope, &delete), async {
-            tokio::time::sleep(head_start).await;
-            store_b.delete(&scope, &delete).await
-        },);
-        first.unwrap_or_else(|error| panic!("run {run}: the first racer: {error}"));
-        second.unwrap_or_else(|error| panic!("run {run}: the second racer: {error}"));
+    let moved = conformance_claim(&scope, "moved", "node-a", "node-b");
+    world
+        .first
+        .store
+        .append(&scope, &moved)
+        .await
+        .expect("the claim appends");
+    let dispute = transition_request(
+        &scope,
+        &moved.claim_id,
+        "dispute",
+        ClaimTrustStatus::Disputed,
+    );
+    let (first, second) = queued_in_order(
+        &world,
+        &scope,
+        &moved.claim_id,
+        transition_on(&world.first.store, &scope, &dispute),
+        transition_on(&world.second.store, &scope, &dispute),
+    )
+    .await;
+    let first = first.unwrap_or_else(|error| panic!("the first transition lands: {error}"));
+    match second {
+        Ok(second) if second == first => {}
+        other => disagreements.push(format!("transition: the second answered {other:?}")),
     }
+
+    let withdrawn = conformance_claim(&scope, "withdrawn", "node-a", "node-c");
+    world
+        .first
+        .store
+        .append(&scope, &withdrawn)
+        .await
+        .expect("the claim appends");
+    let tombstone = tombstone_request(&scope, &withdrawn.claim_id, "withdraw");
+    let (first, second) = queued_in_order(
+        &world,
+        &scope,
+        &withdrawn.claim_id,
+        tombstone_on(&world.first.store, &scope, &tombstone),
+        tombstone_on(&world.second.store, &scope, &tombstone),
+    )
+    .await;
+    let first = first.unwrap_or_else(|error| panic!("the first tombstone lands: {error}"));
+    match second {
+        Ok(second) if second == first => {}
+        other => disagreements.push(format!("tombstone: the second answered {other:?}")),
+    }
+
+    let erased = conformance_claim(&scope, "erased", "node-a", "node-d");
+    world
+        .first
+        .store
+        .append(&scope, &erased)
+        .await
+        .expect("the claim appends");
+    let delete = delete_request(&scope, &erased.claim_id, "erase", None);
+    let (first, second) = queued_in_order(
+        &world,
+        &scope,
+        &erased.claim_id,
+        delete_on(&world.first.store, &scope, &delete),
+        delete_on(&world.second.store, &scope, &delete),
+    )
+    .await;
+    first.unwrap_or_else(|error| panic!("the first delete lands: {error}"));
+    if let Err(error) = second {
+        disagreements.push(format!("delete: the second answered {error}"));
+    }
+
+    assert_eq!(
+        disagreements,
+        Vec::<String>::new(),
+        "a racer queued behind the winner answers the winner's result"
+    );
+    drop_world(world).await;
 }
 
-/// How long a proof waits for a store call on another connection to reach the
-/// row lock it is meant to block on. If the call is slower than this the proof
-/// still passes — it then sees the committed state instead of waiting on it —
-/// so the pause can under-exercise the window but never fail it.
-const BLOCKED_WRITER_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Two callers send the same tombstone, or the same delete, and the second
+/// is stopped between its two reads (issue #136). An erasure reads the ledger
+/// and the claim, then the claim's history; the transition table is locked
+/// from the holder's session, so the first read answers and the second
+/// waits. The holder's session then runs the same request inside its
+/// transaction, and commits. The waiting erasure's history read finds the
+/// claim's fence moved, so it reads again, finds the ledger row, and answers
+/// the holder's result.
+///
+/// A transition makes one read, so it has no such window: its race is the
+/// queued one above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_same_operation_racer_stopped_between_its_two_reads_answers_the_winners_result_when_dsn_is_set(
+) {
+    let Some(world) = lock_world("between_reads_same_op").await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-between-reads-same-op").primary;
+    let lock_transitions = "BEGIN; LOCK TABLE rakka_agent_knowledge_claim_transition \
+                            IN ACCESS EXCLUSIVE MODE";
+
+    let withdrawn = conformance_claim(&scope, "withdrawn", "node-a", "node-c");
+    world
+        .first
+        .store
+        .append(&scope, &withdrawn)
+        .await
+        .expect("the claim appends");
+    let tombstone = tombstone_request(&scope, &withdrawn.claim_id, "withdraw");
+    world
+        .holder
+        .client
+        .batch_execute(lock_transitions)
+        .await
+        .expect("the transition table is locked");
+    let waiting = tokio::spawn(tombstone_on(&world.first.store, &scope, &tombstone));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    let winner = world
+        .holder
+        .store
+        .tombstone(&scope, &tombstone)
+        .await
+        .expect("the tombstone lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    let answered = waiting.await.expect("the waiting tombstone does not panic");
+    assert_eq!(
+        answered.expect("the waiting tombstone answers"),
+        winner,
+        "a tombstone stopped between its reads answers the stub the winner wrote"
+    );
+
+    let erased = conformance_claim(&scope, "erased", "node-a", "node-d");
+    world
+        .first
+        .store
+        .append(&scope, &erased)
+        .await
+        .expect("the claim appends");
+    let delete = delete_request(&scope, &erased.claim_id, "erase", None);
+    world
+        .holder
+        .client
+        .batch_execute(lock_transitions)
+        .await
+        .expect("the transition table is locked");
+    let waiting = tokio::spawn(delete_on(&world.first.store, &scope, &delete));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    world
+        .holder
+        .store
+        .delete(&scope, &delete)
+        .await
+        .expect("the delete lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    waiting
+        .await
+        .expect("the waiting delete does not panic")
+        .unwrap_or_else(|error| {
+            panic!("a delete stopped between its reads answers success: {error}")
+        });
+
+    drop_world(world).await;
+}
+
+/// Two callers send the same operation, and the second is stopped at its
+/// first read (issue #136). Every write starts by reading its operation's
+/// ledger row and the claim in one statement (`WRITE_START_SQL`). The claim
+/// table is locked from the holder's session, so that statement waits before
+/// it takes its snapshot. The holder's session then runs the same request
+/// inside its transaction and commits, and the waiting caller's read sees
+/// both the ledger row and the claim the holder left: it answers the
+/// holder's result.
+///
+/// Read in two statements, the ledger first, a caller stopped between them
+/// would see no ledger row and then a claim its own operation had already
+/// moved, and refuse a request it should answer: the defect section 12.3 of
+/// the #68 design records. This is the proof that fails if the read is ever
+/// split again. All three operations are run before anything is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_same_operation_racer_stopped_at_its_first_read_answers_the_winners_result_when_dsn_is_set(
+) {
+    let Some(world) = lock_world("first_read_same_op").await else {
+        return;
+    };
+    let scope = ConformanceScopes::unique("pg-first-read-same-op").primary;
+    let lock_claims = "BEGIN; LOCK TABLE rakka_agent_knowledge_claim IN ACCESS EXCLUSIVE MODE";
+    let mut disagreements = Vec::new();
+
+    let moved = conformance_claim(&scope, "moved", "node-a", "node-b");
+    world
+        .first
+        .store
+        .append(&scope, &moved)
+        .await
+        .expect("the claim appends");
+    let dispute = transition_request(
+        &scope,
+        &moved.claim_id,
+        "dispute",
+        ClaimTrustStatus::Disputed,
+    );
+    world
+        .holder
+        .client
+        .batch_execute(lock_claims)
+        .await
+        .expect("the claim table is locked");
+    let waiting = tokio::spawn(transition_on(&world.first.store, &scope, &dispute));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    let winner = world
+        .holder
+        .store
+        .transition(&scope, &dispute, &ClaimPromotionPolicy::ungated(), NOW)
+        .await
+        .expect("the transition lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    match waiting
+        .await
+        .expect("the waiting transition does not panic")
+    {
+        Ok(answered) if answered == winner => {}
+        other => disagreements.push(format!("transition: the waiting caller answered {other:?}")),
+    }
+
+    let withdrawn = conformance_claim(&scope, "withdrawn", "node-a", "node-c");
+    world
+        .first
+        .store
+        .append(&scope, &withdrawn)
+        .await
+        .expect("the claim appends");
+    let tombstone = tombstone_request(&scope, &withdrawn.claim_id, "withdraw");
+    world
+        .holder
+        .client
+        .batch_execute(lock_claims)
+        .await
+        .expect("the claim table is locked");
+    let waiting = tokio::spawn(tombstone_on(&world.first.store, &scope, &tombstone));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    let winner = world
+        .holder
+        .store
+        .tombstone(&scope, &tombstone)
+        .await
+        .expect("the tombstone lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    match waiting.await.expect("the waiting tombstone does not panic") {
+        Ok(answered) if answered == winner => {}
+        other => disagreements.push(format!("tombstone: the waiting caller answered {other:?}")),
+    }
+
+    let erased = conformance_claim(&scope, "erased", "node-a", "node-d");
+    world
+        .first
+        .store
+        .append(&scope, &erased)
+        .await
+        .expect("the claim appends");
+    let delete = delete_request(&scope, &erased.claim_id, "erase", None);
+    world
+        .holder
+        .client
+        .batch_execute(lock_claims)
+        .await
+        .expect("the claim table is locked");
+    let waiting = tokio::spawn(delete_on(&world.first.store, &scope, &delete));
+    until_blocked_by(&world.observer, world.first.pid, world.holder.pid).await;
+    world
+        .holder
+        .store
+        .delete(&scope, &delete)
+        .await
+        .expect("the delete lands inside the holder's transaction");
+    world
+        .holder
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the holder commits");
+    if let Err(error) = waiting.await.expect("the waiting delete does not panic") {
+        disagreements.push(format!("delete: the waiting caller answered {error}"));
+    }
+
+    assert_eq!(
+        disagreements,
+        Vec::<String>::new(),
+        "a racer stopped at its first read answers the winner's result"
+    );
+    drop_world(world).await;
+}
 
 /// Whether the ledger's kind check is validated, when the check exists.
 async fn kind_check_validated(client: &Client) -> Option<bool> {
@@ -1654,7 +2176,7 @@ async fn kind_check_validated(client: &Client) -> Option<bool> {
         .map(|row| row.get(0))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_waited_when_dsn_is_set(
 ) {
     // The narrowest way a deleted claim could come back. A duplicate of an
@@ -1666,17 +2188,24 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
     //
     // The interleaving is made exact by running the original append and the
     // delete's effect in one transaction: when it commits, the waiter sees
-    // precisely "no claim row, an erased ledger row".
-    let Some(store) = store().await else { return };
-    let raw = client().await.expect("a raw connection opens");
-    let observer = client().await.expect("a second raw connection opens");
+    // precisely "no claim row, an erased ledger row". The transaction runs on
+    // the holder's session, and the proof goes on only once the duplicate's
+    // session is blocked by it (issue #136): a duplicate that had not reached
+    // the row yet would see the committed state, and the proof would pass
+    // without the interleaving it is about.
+    let Some(world) = lock_world("duplicate_append").await else {
+        return;
+    };
+    let store = &world.first.store;
+    let raw = &*world.holder.client;
+    let observer = &world.observer;
     let scope = ConformanceScopes::unique("pg-append-waits-on-delete").primary;
     let claim = distinctive_claim(&scope, "restored");
 
     raw.batch_execute("BEGIN")
         .await
         .expect("the transaction opens");
-    let row = earlier_append(&raw, &scope, &claim).await;
+    let row = earlier_append(raw, &scope, &claim).await;
     assert!(row.get::<_, bool>("applied"));
 
     // The duplicate: same operation, same claim, through the real store.
@@ -1686,7 +2215,7 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
         let claim = claim.clone();
         tokio::spawn(async move { store.append(&scope, &claim).await })
     };
-    tokio::time::sleep(BLOCKED_WRITER_PAUSE).await;
+    until_blocked_by(observer, world.first.pid, world.holder.pid).await;
 
     // The delete's effect: the claim row gone, its append erased.
     let key: [&(dyn ToSql + Sync); 3] = [
@@ -1723,7 +2252,7 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
             .code(),
         "claim-operation-erased"
     );
-    let rows = scope_rows(&observer, &scope).await;
+    let rows = scope_rows(observer, &scope).await;
     assert!(
         rows.iter().all(|row| row.starts_with(b"op|")),
         "the deleted claim was not restored"
@@ -1734,9 +2263,10 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
         .await
         .expect("the read answers")
         .is_none());
+    drop_world(world).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when_dsn_is_set() {
     // An erasure operation id belongs to one claim. The serial case is a
     // conformance clause; this is the concurrent one. A delete under id X is
@@ -1744,9 +2274,18 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
     // committed — when a delete under the same X arrives for this claim. The
     // second must not apply and skip its ledger row: it waits, finds the id
     // spent, and answers a conflict with its claim untouched.
-    let Some(store) = store().await else { return };
-    let raw = client().await.expect("a raw connection opens");
-    let observer = client().await.expect("a second raw connection opens");
+    //
+    // The other claim's ledger row is written on the holder's session, and the
+    // proof commits it only once the second delete's session is blocked by it
+    // (issue #136). A second delete that had not reached the ledger row yet
+    // would find the id already spent and answer the conflict serially, and
+    // the proof would pass without the wait it is about.
+    let Some(world) = lock_world("id_in_flight").await else {
+        return;
+    };
+    let store = &world.first.store;
+    let raw = &*world.holder.client;
+    let observer = &world.observer;
     let scope = ConformanceScopes::unique("pg-id-in-flight").primary;
 
     for (kind, as_tombstone) in [("delete", false), ("delete", true)] {
@@ -1760,7 +2299,7 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
             .append(&scope, &claim)
             .await
             .expect("the claim appends");
-        let before = scope_rows(&observer, &scope).await;
+        let before = scope_rows(observer, &scope).await;
         let shared = ClaimOperationId::derive_delete(&scope, &claim.claim_id, "shared-request")
             .expect("the operation id derives");
 
@@ -1798,7 +2337,7 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
                 }
             })
         };
-        tokio::time::sleep(BLOCKED_WRITER_PAUSE).await;
+        until_blocked_by(observer, world.first.pid, world.holder.pid).await;
         raw.batch_execute("COMMIT")
             .await
             .expect("the transaction commits");
@@ -1806,12 +2345,18 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
         let answered = second.await.expect("the task completes");
         assert_eq!(
             answered
-                .expect_err("an operation id spent on another claim is refused")
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tombstone: {as_tombstone}: an operation id spent on another claim is \
+                         refused"
+                    )
+                })
                 .code(),
             "claim-operation-conflict",
             "tombstone: {as_tombstone}"
         );
-        let after = scope_rows(&observer, &scope).await;
+        let after = scope_rows(observer, &scope).await;
         assert_eq!(
             after.len(),
             before.len() + 1,
@@ -1826,6 +2371,7 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
             "the claim the reused id named is exactly as it was"
         );
     }
+    drop_world(world).await;
 }
 
 #[tokio::test]

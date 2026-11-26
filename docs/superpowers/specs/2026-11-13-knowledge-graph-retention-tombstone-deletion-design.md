@@ -568,7 +568,7 @@ Started together, a transition always beat a tombstone or a delete, because each
 
 The step is nominal because a runtime timer is far coarser than the 40 microseconds the code names: each non-zero delay is really "up to about a millisecond, by timer phase". It still mixes the orders. Across the builder's and the reviewer's runs, between 3 and 15 of 48 ended "transition first". Neither order is asserted to occur, so on a different machine one branch may go unexercised. Each branch is asserted whenever it does occur. The reviewer removed each statement's fence and saw the matching race proof fail 20 runs out of 20.
 
-Two orders are also proven without any race: the tombstone-first serial order by `a_stub_is_frozen`, and "a tombstone lands between a transition's read and its write" by the frozen-statement proof, since the new build's transition statement is the same text. A deterministic version of the remaining interleaving, holding the claim row locked from a second connection, is not built (deferred).
+Two orders are also proven without any race: the tombstone-first serial order by `a_stub_is_frozen`, and "a tombstone lands between a transition's read and its write" by the frozen-statement proof, since the new build's transition statement is the same text. A deterministic version of the remaining interleaving, holding the claim row locked from a second connection, is not built (deferred). Built later by issue #136: both orders of each race are forced at the database. The two 48-run loops, and the 64-run same-operation loop 12.3 names, were replaced by proofs that force each order (`docs/superpowers/specs/2026-11-25-forced-race-orders-design.md`); 12.3 and 12.4 record the proofs as they stood here.
 
 ### 12.6 Not built
 
