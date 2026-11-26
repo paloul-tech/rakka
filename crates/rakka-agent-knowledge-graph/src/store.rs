@@ -11,13 +11,14 @@
 //!
 //! The core operations — append, get, query, traverse, transition, and the
 //! erasure pair tombstone and delete — are mandatory: a backend that cannot
-//! serve them is not a conformant backend, so they are not "capabilities". Only genuinely optional features are
-//! reported through [`KnowledgeGraphCapabilities`]: keyword search
+//! serve them is not a conformant backend, so they are not "capabilities". Only
+//! genuinely optional features are reported through
+//! [`KnowledgeGraphCapabilities`]: keyword search
 //! ([`KnowledgeGraphStore::search`]) and meaning-based search
-//! ([`KnowledgeGraphStore::search_semantic`] and the two operations that
-//! keep its embeddings). An optional operation's default body answers
-//! `claim-capability-unsupported`, so a caller of a backend that does not
-//! serve it learns so instead of reading an empty answer as "nothing found".
+//! ([`KnowledgeGraphStore::search_semantic`] and the two operations that keep
+//! its embeddings). An optional operation's default body answers
+//! `claim-capability-unsupported`, so a caller of a backend that does not serve
+//! it learns so instead of reading an empty answer as "nothing found".
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};

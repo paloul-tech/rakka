@@ -1451,7 +1451,7 @@ mod tests {
     fn tombstone(discriminator: &str) -> ClaimTombstone {
         let claim = claim();
         ClaimTombstone {
-            operation_id: ClaimOperationId::derive_transition(
+            operation_id: ClaimOperationId::derive_tombstone(
                 &scope(),
                 &claim.claim_id,
                 discriminator,
