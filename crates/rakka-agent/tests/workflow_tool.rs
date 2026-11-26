@@ -4211,6 +4211,73 @@ async fn a_review_granted_while_the_run_rests_on_its_children_leaves_its_status(
     assert_eq!(rest_of(&fixture).await, resting);
 }
 
+/// Issue #70: a turn awaits two workflow starts, each behind an approval
+/// that expires a second after it opens. One gate is granted and its start
+/// goes out; the other expires, and its start fails. That failure is the
+/// last of the turn's calls to settle, so the turn rests on the child still
+/// running, through the timer: the `FireCheckpointTimers` command commits
+/// the park, and closes the run's one `wait` segment.
+#[tokio::test]
+async fn an_expired_approval_on_a_members_start_parks_through_the_timer() {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let mut fixture = workflow_fixture(
+        RecordingWorkflowExecutor::new(StartMode::Started),
+        two_starts_await_turn(),
+    )
+    .with_segments(sink.clone());
+    fixture.policies = rakka_agent::AgentEffectPolicies::new()
+        .with_workflow_start_spec(approval_gated())
+        .expect("the gated start spec is valid")
+        .with_checkpoint_sla(a_second());
+    create_workflow_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+    let gates = waiting_gates(&fixture).await;
+    assert_eq!(gates.len(), 2, "both starts wait on a gate: {gates:?}");
+
+    apply_to_run(&fixture, gate_decision(&gates[0].0, "first-granted", true)).await;
+    fixture.pump().await.expect("the loop should converge");
+    assert_eq!(
+        rest_of(&fixture).await.0,
+        AgentLoopPhase::AwaitingTools,
+        "the other start still waits on its gate"
+    );
+    let waits = |sink: &rakka_agent::InMemoryAgentSegmentSink| {
+        sink.operations()
+            .iter()
+            .filter(|operation| **operation == "wait")
+            .count()
+    };
+    assert_eq!(waits(&sink), 0, "{:?}", sink.operations());
+
+    let expires = gates[1].0.expires_at.expect("the SLA stamped an expiry");
+    fixture
+        .clock
+        .store(expires.as_millis() + 1, Ordering::SeqCst);
+    apply_to_run(
+        &fixture,
+        AgentRunEntityCommand::FireCheckpointTimers {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                &common::agent_scope(),
+                "timer",
+            )
+            .expect("the timer key derives"),
+        },
+    )
+    .await;
+    assert_eq!(
+        rest_of(&fixture).await.0,
+        AgentLoopPhase::AwaitingChildren,
+        "the turn rests on the child still running"
+    );
+    assert_eq!(
+        waits(&sink),
+        1,
+        "the timer's command parked the run: {:?}",
+        sink.operations()
+    );
+}
+
 /// A turn that fans out to two workflows and awaits them.
 fn two_starts_await_turn() -> AgentModelTurn {
     AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)

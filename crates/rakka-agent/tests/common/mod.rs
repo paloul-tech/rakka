@@ -2446,6 +2446,27 @@ pub async fn create_fan_out_task(fixture: &Fixture, policy: Option<AgentFanInPol
         .expect("the goal task should create");
 }
 
+/// [`create_fan_out_task`] under a trace context, so the run's segments
+/// carry durable span identities (issue #70).
+pub async fn create_fan_out_task_traced(
+    fixture: &Fixture,
+    policy: Option<AgentFanInPolicy>,
+    telemetry: rakka_agent_workflow::AgentTelemetryContext,
+) {
+    fixture.instantiate_agent().await;
+    let mut command = goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec_with_fan_out(policy, None), true),
+    );
+    if let AgentTaskEntityCommand::Create { creation, .. } = &mut command {
+        creation.telemetry = telemetry;
+    }
+    fixture
+        .apply_task_command(command)
+        .await
+        .expect("the goal task should create");
+}
+
 /// The committed members, read from the durable cells: `(delegation id,
 /// created child task)` per settled cell, in deterministic map order.
 pub async fn committed_children(fixture: &Fixture) -> Vec<(AgentDelegationId, AgentTaskId)> {

@@ -2349,6 +2349,16 @@ pub const SEGMENT_ATTR_LOOP_TRANSITIONS: &str = "rakka.agent.loop.transitions";
 
 /// Segment attribute: the bounded checkpoint kind a park opened.
 pub const SEGMENT_ATTR_CHECKPOINT_KIND: &str = "rakka.agent.checkpoint.kind";
+/// Segment attribute: the bounded wait kind of a `wait` or `wait-resolve`
+/// segment ([`AGENT_WAIT_KIND_CHILDREN`]).
+pub const SEGMENT_ATTR_WAIT_KIND: &str = "rakka.agent.wait.kind";
+/// Segment attribute: the bounded policy of the fan-in group a run parked on
+/// (`all`, `any`, `quorum`).
+pub const SEGMENT_ATTR_FAN_IN_POLICY: &str = "rakka.agent.fan_in.policy";
+/// Segment attribute: the bounded resolution code of the fan-in group a
+/// `wait-resolve` segment resolved, the codes
+/// [`METRIC_AGENT_FAN_IN_RESOLUTIONS`] counts.
+pub const SEGMENT_ATTR_FAN_IN_RESOLUTION: &str = "rakka.agent.fan_in.resolution";
 
 /// Measures one *live* bounded operation — a transition, a dispatch attempt,
 /// a provider call — and closes it into a segment.

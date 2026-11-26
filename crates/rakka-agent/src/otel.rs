@@ -159,6 +159,14 @@ pub const ATTR_RAKKA_AGENT_EFFECT_ATTEMPT: &str = crate::observability::SEGMENT_
 /// Rakka attribute: the bounded checkpoint kind a park opened.
 pub const ATTR_RAKKA_AGENT_CHECKPOINT_KIND: &str =
     crate::observability::SEGMENT_ATTR_CHECKPOINT_KIND;
+/// Rakka attribute: the bounded wait kind of a run's park or its resolution.
+pub const ATTR_RAKKA_AGENT_WAIT_KIND: &str = crate::observability::SEGMENT_ATTR_WAIT_KIND;
+/// Rakka attribute: the bounded policy of the fan-in group a run parked on.
+pub const ATTR_RAKKA_AGENT_FAN_IN_POLICY: &str = crate::observability::SEGMENT_ATTR_FAN_IN_POLICY;
+/// Rakka attribute: the bounded resolution code of the fan-in group a run's
+/// wait resolved.
+pub const ATTR_RAKKA_AGENT_FAN_IN_RESOLUTION: &str =
+    crate::observability::SEGMENT_ATTR_FAN_IN_RESOLUTION;
 /// Rakka attribute: the bounded A2A operation class of an ingress segment.
 pub const ATTR_RAKKA_AGENT_A2A_OPERATION: &str = "rakka.agent.a2a.operation";
 /// Rakka attribute: the bounded memory tier of a memory segment.
@@ -223,6 +231,8 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_RAKKA_AGENT_EFFECT_KIND,
     ATTR_RAKKA_AGENT_EFFECT_SAFETY,
     ATTR_RAKKA_AGENT_EFFECT_STATUS,
+    ATTR_RAKKA_AGENT_FAN_IN_POLICY,
+    ATTR_RAKKA_AGENT_FAN_IN_RESOLUTION,
     ATTR_RAKKA_AGENT_GOAL_ID,
     ATTR_RAKKA_AGENT_LOOP_PHASE,
     ATTR_RAKKA_AGENT_LOOP_TRANSITIONS,
@@ -232,6 +242,7 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_RAKKA_AGENT_SETTINGS_REVISION,
     ATTR_RAKKA_AGENT_TASK_ID,
     ATTR_RAKKA_AGENT_TURN_INDEX,
+    ATTR_RAKKA_AGENT_WAIT_KIND,
     ATTR_RAKKA_ERROR_CODE,
 ];
 

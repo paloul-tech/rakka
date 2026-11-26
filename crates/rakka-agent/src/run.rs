@@ -119,8 +119,8 @@ use crate::observability::{
     record_unsettleable_exchanges, AgentDecisionCheckpoint, AgentDecisionDraft, AgentDecisionEvent,
     AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
     AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
-    AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
-    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
+    AgentSegmentTimer, AGENT_WAIT_KIND_CHILDREN, LINK_KIND_AMBIGUOUS_ATTEMPT,
+    LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
     METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES, METRIC_AGENT_COMMUNAL_RETRIEVALS,
     METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
     METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
@@ -129,7 +129,8 @@ use crate::observability::{
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
     METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_EFFECT_ATTEMPT,
-    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
+    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_FAN_IN_POLICY, SEGMENT_ATTR_LOOP_TRANSITIONS,
+    SEGMENT_ATTR_SETTINGS_REVISION, SEGMENT_ATTR_WAIT_KIND,
 };
 use crate::query::AgentCheckpointBoundEffectView;
 use crate::schema::{
@@ -8936,6 +8937,10 @@ where
         }
 
         let records_decision = command.records_decision();
+        // Read before the arm's transition, for the child wait it may park
+        // (issue #70). Inside this function, so a command answered again
+        // after a re-read reads it again.
+        let parked_before = self.parked_group_now();
         let reply = match command {
             AgentRunEntityCommand::Describe => {
                 return Ok(AgentRunEntityReply::Snapshot(
@@ -9211,6 +9216,9 @@ where
             }
         };
 
+        // The arm's own transition, before the settle pass's: a park it
+        // committed closes its `wait` segment here.
+        self.close_wait_park(parked_before, now);
         // The command's transition committed. Whether it resolved a
         // checkpoint, and whether it left the run terminal, is decided here.
         self.note_committed_transition();
@@ -9228,7 +9236,10 @@ where
     ) -> AgentRunResult<AgentExchangeReply> {
         self.ensure_recovered(now).await?;
         let resolution_before = self.fan_in_resolution();
+        let parked_before = self.parked_group_now();
         let reply = self.host.accept(envelope, now).await?;
+        // The acceptance's own transition, before the crank's.
+        self.close_wait_park(parked_before, now);
         if envelope.kind() == AgentExchangeKind::DelegationResult {
             let outcome = if reply.result().is_accepted() {
                 "accepted"
@@ -9919,6 +9930,7 @@ where
                     .ok(),
             );
             self.close_checkpoint_open_segments(opened, now);
+            self.close_wait_park(marks.parked, now);
             if let Some((usage, started_at)) = turn_measurements {
                 if let Some(started_at) = started_at {
                     record_agent_domain_duration(
@@ -10119,6 +10131,57 @@ where
                 };
             self.close_segment_linked(segment, links);
         }
+    }
+
+    /// The fan-in group the cached record shows the run parked on
+    /// ([`parked_group`]).
+    fn parked_group_now(&self) -> Option<(u64, AgentTimestampMillis)> {
+        self.state()
+            .ok()
+            .and_then(AgentRunState::loop_state)
+            .and_then(parked_group)
+    }
+
+    /// Closes the `wait` segment of a park the transition just committed:
+    /// the run is parked on a group after it, and was not parked on that
+    /// group before it (issue #70,
+    /// [specification 17.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The segment ends at the durable park, as `checkpoint-open` does, and
+    /// exports under the identity derived from the run's context and the
+    /// group ([`crate::fan_in::AgentFanInCell::parked_span_identity`]), so the
+    /// transition that resolves the group links to it without either storing
+    /// it.
+    fn close_wait_park(
+        &self,
+        before: Option<(u64, AgentTimestampMillis)>,
+        now: AgentTimestampMillis,
+    ) {
+        if self.segments.is_none() {
+            return;
+        }
+        let Some(loop_state) = self.state().ok().and_then(AgentRunState::loop_state) else {
+            return;
+        };
+        let Some(after) = parked_group(loop_state) else {
+            return;
+        };
+        if before == Some(after) {
+            return;
+        }
+        let Some(group) = loop_state.fan_in() else {
+            return;
+        };
+        let mut segment = AgentSegmentTimer::start(now)
+            .close(AgentSegmentOperation::Wait {
+                kind: AGENT_WAIT_KIND_CHILDREN,
+            })
+            .attribute(SEGMENT_ATTR_WAIT_KIND, AGENT_WAIT_KIND_CHILDREN)
+            .attribute(SEGMENT_ATTR_FAN_IN_POLICY, group.policy.as_label());
+        if let Some(identity) = group.parked_span_identity(loop_state.telemetry()) {
+            segment = segment.span_id(identity.span_id);
+        }
+        self.close_segment(segment.ok());
     }
 
     /// The marks a command's transition is measured against, read from the
@@ -11705,6 +11768,8 @@ struct AgentSegmentMarks {
     decision_sequence: u64,
     /// The checkpoints already open.
     checkpoints: BTreeSet<HumanCheckpointId>,
+    /// The fan-in group the run was parked on ([`parked_group`]).
+    parked: Option<(u64, AgentTimestampMillis)>,
 }
 
 /// Reads the marks a transition is measured against.
@@ -11716,7 +11781,25 @@ fn segment_marks(loop_state: &AgentLoopState) -> AgentSegmentMarks {
             .iter()
             .map(|checkpoint| checkpoint.checkpoint_id.clone())
             .collect(),
+        parked: parked_group(loop_state),
     }
+}
+
+/// The fan-in group the run is parked on, by its identity
+/// `(opened_turn, opened_at)`: its closed, unresolved group, while its phase
+/// waits on children (issue #70).
+///
+/// A run resting on `AwaitingChildren` for a handoff alone has none: a
+/// handoff is no child wait. On a parent that is winding down, a resolution
+/// leaves the phase where it was, and the group no longer awaits: the wait
+/// has ended there too.
+fn parked_group(loop_state: &AgentLoopState) -> Option<(u64, AgentTimestampMillis)> {
+    if loop_state.phase() != AgentLoopPhase::AwaitingChildren || !loop_state.awaits_fan_in() {
+        return None;
+    }
+    loop_state
+        .fan_in()
+        .map(|group| (group.opened_turn, group.opened_at))
 }
 
 /// One checkpoint a transition opened, as the `checkpoint-open` segment that
