@@ -2562,7 +2562,10 @@ async fn a_checkpoint_timer_with_nothing_due_repairs_a_record_and_a_fan_in_deadl
         )
         .expect("the timer key derives");
         if fan_in {
-            AgentRunEntityCommand::FireFanInDeadline { operation_id }
+            AgentRunEntityCommand::FireFanInDeadline {
+                operation_id,
+                telemetry: Default::default(),
+            }
         } else {
             AgentRunEntityCommand::FireCheckpointTimers { operation_id }
         }

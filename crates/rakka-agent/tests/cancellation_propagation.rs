@@ -563,6 +563,7 @@ async fn a_fired_deadline_chases_the_stragglers_it_timed_out() {
     run.recover(fixture.now()).await.expect("recover");
     run.apply(
         AgentRunEntityCommand::FireFanInDeadline {
+            telemetry: Default::default(),
             operation_id: rakka_agent::AgentOperationId::new(
                 rakka_agent::AgentOperationKind::Command,
                 [TENANT, "fan-in-deadline", "due"],

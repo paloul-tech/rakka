@@ -336,6 +336,7 @@ fn only_resolutions_are_run_decisions() {
     }
     .records_decision());
     assert!(!AgentRunEntityCommand::FireFanInDeadline {
+        telemetry: Default::default(),
         operation_id: decision_key("deadline"),
     }
     .records_decision());

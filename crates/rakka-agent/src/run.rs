@@ -119,17 +119,19 @@ use crate::observability::{
     record_unsettleable_exchanges, AgentDecisionCheckpoint, AgentDecisionDraft, AgentDecisionEvent,
     AgentDecisionEventSink, AgentDecisionEventVocabulary, AgentDecisionKind, AgentDecisionOutcome,
     AgentDecisionSource, AgentSegmentIdentity, AgentSegmentOperation, AgentSegmentSink,
-    AgentSegmentTimer, LINK_KIND_AMBIGUOUS_ATTEMPT, LINK_KIND_PARKED_CHECKPOINT,
-    LINK_KIND_RECONCILIATION_DECISION, LINK_KIND_RESUME_REQUEST,
-    METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES, METRIC_AGENT_COMMUNAL_RETRIEVALS,
-    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
-    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EFFECT_OUTSTANDING_DURATION,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION,
-    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_TURN_DURATION,
-    METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND, SEGMENT_ATTR_EFFECT_ATTEMPT,
-    SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
+    AgentSegmentTimer, AGENT_WAIT_KIND_CHILDREN, LINK_KIND_AMBIGUOUS_ATTEMPT,
+    LINK_KIND_PARKED_CHECKPOINT, LINK_KIND_PARKED_WAIT, LINK_KIND_RECONCILIATION_DECISION,
+    LINK_KIND_RESUME_REQUEST, METRIC_AGENT_COMMUNAL_INGRESS_OUTCOMES,
+    METRIC_AGENT_COMMUNAL_RETRIEVALS, METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS,
+    METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_EFFECT_OUTSTANDING_DURATION, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_MODEL_TOKENS, METRIC_AGENT_RECOVERY_DURATION, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_TURN_DURATION, METRIC_AGENT_WORKFLOW_RESULTS, SEGMENT_ATTR_CHECKPOINT_KIND,
+    SEGMENT_ATTR_EFFECT_ATTEMPT, SEGMENT_ATTR_EFFECT_STATUS, SEGMENT_ATTR_FAN_IN_POLICY,
+    SEGMENT_ATTR_FAN_IN_RESOLUTION, SEGMENT_ATTR_LOOP_TRANSITIONS, SEGMENT_ATTR_SETTINGS_REVISION,
+    SEGMENT_ATTR_WAIT_KIND,
 };
 use crate::query::AgentCheckpointBoundEffectView;
 use crate::schema::{
@@ -8790,6 +8792,18 @@ where
         // Read now, for a segment that may close after the cached record is
         // gone.
         let context_before = self.loop_telemetry();
+        // A child wait the command finds the run parked on: the links its
+        // `run-resume` carries if this command closes one (issue #70), read
+        // before the transition, as the checkpoint's are.
+        let park_links = self
+            .state()
+            .ok()
+            .and_then(AgentRunState::loop_state)
+            .and_then(|loop_state| {
+                parked_group(loop_state).map(|group| {
+                    parked_wait_links(self.scope(), loop_state, group, command.trigger_telemetry())
+                })
+            });
         self.resolving = resolving
             .as_ref()
             .map(|resolving| resolving.checkpoint_id.clone());
@@ -8901,6 +8915,15 @@ where
             let answered_a_park = committed.resolved && names_a_park && !found_winding_down;
             let resumed = resumed && (!from_a_park || answered_a_park);
             if resumed {
+                // A command that resolved a checkpoint already links its
+                // request; the same span is not linked twice.
+                for link in park_links.into_iter().flatten() {
+                    if !links.iter().any(|held: &AgentSpanLink| {
+                        held.trace_id == link.trace_id && held.span_id == link.span_id
+                    }) {
+                        links.push(link);
+                    }
+                }
                 self.close_segment_under(
                     timer.close(AgentSegmentOperation::RunResume).ok(),
                     context,
@@ -8936,6 +8959,17 @@ where
         }
 
         let records_decision = command.records_decision();
+        // Read before the arm's transition, for the child wait it may park
+        // (issue #70). Inside this function, so a command answered again
+        // after a re-read reads it again.
+        let parked_before = self.parked_group_now();
+        // What the resolution of that wait would carry: the request's
+        // context, boxed so the future holds a pointer across the arm's
+        // awaits, and the call's own timer.
+        let resolve_trigger = parked_before
+            .and_then(|_| command.trigger_telemetry().cloned())
+            .map(Box::new);
+        let resolve_timer = AgentSegmentTimer::start(now);
         let reply = match command {
             AgentRunEntityCommand::Describe => {
                 return Ok(AgentRunEntityReply::Snapshot(
@@ -9100,7 +9134,7 @@ where
                 })
                 .await?
             }
-            AgentRunEntityCommand::FireFanInDeadline { operation_id } => {
+            AgentRunEntityCommand::FireFanInDeadline { operation_id, .. } => {
                 if let Some(unchanged) = self.unchanged_by(fire_fan_in_deadline, now)? {
                     return Ok(unchanged);
                 }
@@ -9118,6 +9152,7 @@ where
                 terminal_reason,
                 result_ref,
                 result_digest,
+                ..
             } => {
                 let reply = self
                     .transition(now, records_decision, move |state| {
@@ -9210,6 +9245,11 @@ where
             }
         };
 
+        // The arm's own transition, before the settle pass's: a park it
+        // committed closes its `wait` segment here, and a child wait it
+        // ended its `wait-resolve`.
+        self.close_wait_park(parked_before, now);
+        self.close_wait_resolve(parked_before, resolve_trigger.as_deref(), resolve_timer);
         // The command's transition committed. Whether it resolved a
         // checkpoint, and whether it left the run terminal, is decided here.
         self.note_committed_transition();
@@ -9227,7 +9267,13 @@ where
     ) -> AgentRunResult<AgentExchangeReply> {
         self.ensure_recovered(now).await?;
         let resolution_before = self.fan_in_resolution();
+        let parked_before = self.parked_group_now();
+        let resolve_timer = AgentSegmentTimer::start(now);
         let reply = self.host.accept(envelope, now).await?;
+        // The acceptance's own transition, before the crank's: a child's
+        // result that ends the wait links the child's span.
+        self.close_wait_park(parked_before, now);
+        self.close_wait_resolve(parked_before, Some(envelope.telemetry()), resolve_timer);
         if envelope.kind() == AgentExchangeKind::DelegationResult {
             let outcome = if reply.result().is_accepted() {
                 "accepted"
@@ -9417,7 +9463,15 @@ where
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
             let decisions = self.flush_decision_events(now).await?;
+            // Settling a reply commits a transition of its own: the children's
+            // refusals of a parked run's cancel can end it, and so its wait
+            // (issue #70). No exchange arriving here caused it, so the
+            // resolution links the park alone.
+            let parked_before = self.parked_group_now();
+            let settle_timer = AgentSegmentTimer::start(now);
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
+            self.close_wait_park(parked_before, now);
+            self.close_wait_resolve(parked_before, None, settle_timer);
 
             progress.transitions += advanced + cancels;
             progress.effects_dispatched += dispatched;
@@ -9918,6 +9972,8 @@ where
                     .ok(),
             );
             self.close_checkpoint_open_segments(opened, now);
+            self.close_wait_park(marks.parked, now);
+            self.close_wait_resolve(marks.parked, None, AgentSegmentTimer::start(now));
             if let Some((usage, started_at)) = turn_measurements {
                 if let Some(started_at) = started_at {
                     record_agent_domain_duration(
@@ -10118,6 +10174,100 @@ where
                 };
             self.close_segment_linked(segment, links);
         }
+    }
+
+    /// The fan-in group the cached record shows the run parked on
+    /// ([`parked_group`]).
+    fn parked_group_now(&self) -> Option<(u64, AgentTimestampMillis)> {
+        self.state()
+            .ok()
+            .and_then(AgentRunState::loop_state)
+            .and_then(parked_group)
+    }
+
+    /// Closes the `wait` segment of a park the transition just committed:
+    /// the run is parked on a group after it, and was not parked on that
+    /// group before it (issue #70,
+    /// [specification 17.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The segment ends at the durable park, as `checkpoint-open` does, and
+    /// exports under the identity derived from the run's context, the run and
+    /// the group ([`crate::fan_in::AgentFanInCell::parked_span_identity`]), so the
+    /// transition that resolves the group links to it without either storing
+    /// it.
+    fn close_wait_park(
+        &self,
+        before: Option<(u64, AgentTimestampMillis)>,
+        now: AgentTimestampMillis,
+    ) {
+        if self.segments.is_none() {
+            return;
+        }
+        let Some(loop_state) = self.state().ok().and_then(AgentRunState::loop_state) else {
+            return;
+        };
+        let Some(after) = parked_group(loop_state) else {
+            return;
+        };
+        if before == Some(after) {
+            return;
+        }
+        let Some(group) = loop_state.fan_in() else {
+            return;
+        };
+        let mut segment = AgentSegmentTimer::start(now)
+            .close(AgentSegmentOperation::Wait {
+                kind: AGENT_WAIT_KIND_CHILDREN,
+            })
+            .attribute(SEGMENT_ATTR_WAIT_KIND, AGENT_WAIT_KIND_CHILDREN)
+            .attribute(SEGMENT_ATTR_FAN_IN_POLICY, group.policy.as_label());
+        if let Some(identity) = group.parked_span_identity(self.scope(), loop_state.telemetry()) {
+            segment = segment.span_id(identity.span_id);
+        }
+        self.close_segment(segment.ok());
+    }
+
+    /// Closes the `wait-resolve` segment of a child wait the transition just
+    /// ended: the run was parked on `before` ahead of it and is not parked on
+    /// that group after it (issue #70). The child wait's counterpart to
+    /// `checkpoint-resolve`: its subject is the resolving transition, so it
+    /// closes here, before the settle pass, whatever that pass does next.
+    ///
+    /// It links the park and `trigger`, the request, exchange or timer whose
+    /// own transition ended the wait ([`parked_wait_links`]). A crank step
+    /// has no trigger.
+    fn close_wait_resolve(
+        &self,
+        before: Option<(u64, AgentTimestampMillis)>,
+        trigger: Option<&AgentTelemetryContext>,
+        timer: AgentSegmentTimer,
+    ) {
+        let Some(before) = before else {
+            return;
+        };
+        if self.segments.is_none() {
+            return;
+        }
+        let Some(loop_state) = self.state().ok().and_then(AgentRunState::loop_state) else {
+            return;
+        };
+        if parked_group(loop_state) == Some(before) {
+            return;
+        }
+        let mut segment = timer
+            .close(AgentSegmentOperation::WaitResolve {
+                kind: AGENT_WAIT_KIND_CHILDREN,
+            })
+            .attribute(SEGMENT_ATTR_WAIT_KIND, AGENT_WAIT_KIND_CHILDREN);
+        if let Some(resolution) = loop_state
+            .fan_in()
+            .filter(|cell| (cell.opened_turn, cell.opened_at) == before)
+            .and_then(|cell| cell.resolution.as_ref())
+        {
+            segment = segment.attribute(SEGMENT_ATTR_FAN_IN_RESOLUTION, resolution.code.clone());
+        }
+        let links = parked_wait_links(self.scope(), loop_state, before, trigger);
+        self.close_segment_under(segment.ok(), loop_state.telemetry().clone(), links);
     }
 
     /// The marks a command's transition is measured against, read from the
@@ -10754,6 +10904,15 @@ pub enum AgentRunEntityCommand {
     FireFanInDeadline {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
+        /// The trace context of the host's span that sent this command, for
+        /// the `resume-request` link of the `wait-resolve` segment the command
+        /// closes when it ends the run's child wait (issue #70,
+        /// [specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+        /// Observability only: it is never persisted and no transition reads
+        /// it. A command encoded before this field decodes to the empty
+        /// context. Set it with [`Self::with_telemetry`].
+        #[serde(default)]
+        telemetry: AgentTelemetryContext,
     },
     /// One child workflow run's terminal outcome, recorded on the invocation
     /// cell that owns it
@@ -10819,6 +10978,15 @@ pub enum AgentRunEntityCommand {
         /// Content digest of the child's result, when one exists.
         #[serde(default)]
         result_digest: Option<crate::task::AgentContentDigest>,
+        /// The trace context of the host's span that sent this command, for
+        /// the `resume-request` link of the `wait-resolve` segment the command
+        /// closes when it ends the run's child wait (issue #70,
+        /// [specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+        /// Observability only: it is never persisted and no transition reads
+        /// it. A command encoded before this field decodes to the empty
+        /// context. Set it with [`Self::with_telemetry`].
+        #[serde(default)]
+        telemetry: AgentTelemetryContext,
     },
     /// Request cancellation of the run.
     Cancel {
@@ -10895,7 +11063,7 @@ impl AgentRunEntityCommand {
             | Self::ResolveIndeterminateEffect { operation_id, .. }
             | Self::ResolveCheckpoint { operation_id, .. }
             | Self::FireCheckpointTimers { operation_id }
-            | Self::FireFanInDeadline { operation_id }
+            | Self::FireFanInDeadline { operation_id, .. }
             | Self::RecordWorkflowResult { operation_id, .. }
             | Self::Cancel { operation_id, .. }
             | Self::PromoteMemory { operation_id, .. }
@@ -10905,9 +11073,46 @@ impl AgentRunEntityCommand {
         }
     }
 
+    /// This command with `telemetry` as the trace context it carries, when it
+    /// is one of the two commands that can end a run's child wait from
+    /// outside the run: [`Self::RecordWorkflowResult`] and
+    /// [`Self::FireFanInDeadline`]. Every other command is returned
+    /// unchanged. The context is admitted through
+    /// [`crate::observability::sanitize_agent_telemetry_context`].
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        match &mut self {
+            Self::RecordWorkflowResult {
+                telemetry: carried, ..
+            }
+            | Self::FireFanInDeadline {
+                telemetry: carried, ..
+            } => {
+                *carried = crate::observability::sanitize_agent_telemetry_context(telemetry);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// The trace context of the request that sent this command, for the
+    /// `resume-request` link of a resolution it causes: the two child-wait
+    /// commands' and the two checkpoint resolutions' own field. `None` for a
+    /// command that carries none.
+    pub(crate) fn trigger_telemetry(&self) -> Option<&AgentTelemetryContext> {
+        match self {
+            Self::RecordWorkflowResult { telemetry, .. }
+            | Self::FireFanInDeadline { telemetry, .. }
+            | Self::ResolveCheckpoint { telemetry, .. }
+            | Self::ResolveIndeterminateEffect { telemetry, .. } => Some(telemetry),
+            _ => None,
+        }
+    }
+
     /// Builds one child workflow run's result command with its derived
     /// operation id, so the relay cannot mis-derive the identity every
-    /// re-drive must share.
+    /// re-drive must share. It carries no trace context; set one with
+    /// [`Self::with_telemetry`].
     #[allow(clippy::too_many_arguments)]
     pub fn record_workflow_result(
         tenant: &TenantId,
@@ -10927,6 +11132,7 @@ impl AgentRunEntityCommand {
             terminal_reason,
             result_ref: result_ref.map(Box::new),
             result_digest,
+            telemetry: AgentTelemetryContext::default(),
         })
     }
 }
@@ -11662,6 +11868,8 @@ struct AgentSegmentMarks {
     decision_sequence: u64,
     /// The checkpoints already open.
     checkpoints: BTreeSet<HumanCheckpointId>,
+    /// The fan-in group the run was parked on ([`parked_group`]).
+    parked: Option<(u64, AgentTimestampMillis)>,
 }
 
 /// Reads the marks a transition is measured against.
@@ -11673,7 +11881,50 @@ fn segment_marks(loop_state: &AgentLoopState) -> AgentSegmentMarks {
             .iter()
             .map(|checkpoint| checkpoint.checkpoint_id.clone())
             .collect(),
+        parked: parked_group(loop_state),
     }
+}
+
+/// The fan-in group the run is parked on, by its identity
+/// `(opened_turn, opened_at)`: its closed, unresolved group, while its phase
+/// waits on children (issue #70).
+///
+/// A run resting on `AwaitingChildren` for a handoff alone has none: a
+/// handoff is no child wait. On a parent that is winding down, a resolution
+/// leaves the phase where it was, and the group no longer awaits: the wait
+/// has ended there too.
+fn parked_group(loop_state: &AgentLoopState) -> Option<(u64, AgentTimestampMillis)> {
+    if loop_state.phase() != AgentLoopPhase::AwaitingChildren || !loop_state.awaits_fan_in() {
+        return None;
+    }
+    loop_state
+        .fan_in()
+        .map(|group| (group.opened_turn, group.opened_at))
+}
+
+/// The links a resolution of the child wait on `group` carries
+/// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md), issue
+/// #70): the parked `wait` span, by the identity the park derived from the
+/// run's context, the run and the group, and the span of the request, exchange or
+/// timer that caused it, when `trigger` holds a valid trace context.
+fn parked_wait_links(
+    run: &AgentRunScope,
+    loop_state: &AgentLoopState,
+    group: (u64, AgentTimestampMillis),
+    trigger: Option<&AgentTelemetryContext>,
+) -> Vec<AgentSpanLink> {
+    let mut links = Vec::new();
+    if let Some(parked) = loop_state
+        .fan_in()
+        .filter(|cell| (cell.opened_turn, cell.opened_at) == group)
+        .and_then(|cell| cell.parked_span_identity(run, loop_state.telemetry()))
+    {
+        links.push(agent_span_link(&parked, LINK_KIND_PARKED_WAIT));
+    }
+    if let Some(request) = trigger.and_then(|trigger| require_agent_trace_context(trigger).ok()) {
+        links.push(agent_span_link(&request, LINK_KIND_RESUME_REQUEST));
+    }
+    links
 }
 
 /// One checkpoint a transition opened, as the `checkpoint-open` segment that

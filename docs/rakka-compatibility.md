@@ -1188,6 +1188,19 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** Nothing durable changes, so builds before and after read and write the same rows.
 
+- Issue #70 ("a child wait closes no park segment, so its resume has nothing to link"): **a run's wait on its children is traced.** This is additive on the wire and in durable state, and source-breaking in one place, the command field below. **No durable field, status, error code or decision kind is added.**
+
+  **What is new** (`rakka-agent`):
+  - **Two segment classes**, `AgentSegmentOperation::Wait` (`wait`, `rakka.agent.run.wait`) and `::WaitResolve` (`wait-resolve`, `rakka.agent.run.wait.resolve`), both `INTERNAL`, and `AGENT_WAIT_KIND_CHILDREN`, the one wait kind they carry today.
+  - **One link kind**, `parked-wait`, in `AGENT_TELEMETRY_LINK_KINDS`. `resume-request` is now written on `wait-resolve` too.
+  - **Three span attributes**, `rakka.agent.wait.kind`, `rakka.agent.fan_in.policy` and `rakka.agent.fan_in.resolution`, in `AGENT_SPAN_ATTRIBUTE_KEYS` and in the gateway Collector's allowlist (`docs/plans/rakka-agent/kubernetes-agent-otel-collector-topology.yaml`). A deployment with its own Collector allowlist adds them, or drops them there.
+  - **One command field on two commands.** `AgentRunEntityCommand::RecordWorkflowResult` and `::FireFanInDeadline` gain `telemetry: AgentTelemetryContext` (`#[serde(default)]`; commands are JSON-encoded, so one encoded before the field decodes to the empty context), set with `AgentRunEntityCommand::with_telemetry`. It carries the relay's or the scheduler's trace context for the resolution's `resume-request` link — observability only, never read by the transition and never persisted. `ResolveCheckpoint` and `ResolveIndeterminateEffect` already carried theirs. The field is source-breaking for a struct literal or a pattern that names every field of either variant. `FireFanInDeadline` has no constructor, so a host that fires the deadline builds a literal and adds `telemetry: AgentTelemetryContext::default()`; a pattern adds `..`.
+  - **`AgentFanInCell::parked_span_identity`**, the park's span identity, derived from the run's context, the run's scope and the group's turn and timestamp. Both ends derive it; nothing stores it. The run is in it because one request's trace context can be several runs'.
+
+  **What a deployment sees.** Two more spans per child wait. `rakka.agent.run.resume` closes exactly as before (the crate's earlier tests close the same 24, in the same tests); when it closes for a command that found the run parked on its children, it carries the two links. A `parked-wait` link can name a span nobody exported, for a park committed by an earlier build, with no segment sink wired, or under a context a later `Assignment` rewrote.
+
+  **Mixed builds and rollback.** Nothing durable changes. A host that sends either command without `telemetry` to a newer build gets no `resume-request` on the resolution; an older build ignores a newer host's `telemetry`, because `AgentRunEntityCommand` denies no unknown field (`child_wait_segments.rs::commands_without_a_trace_context_decode_to_an_empty_one`).
+
 Run the default compatibility matrix:
 
 ```sh

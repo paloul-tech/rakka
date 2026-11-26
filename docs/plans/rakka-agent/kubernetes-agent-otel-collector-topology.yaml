@@ -328,11 +328,13 @@ data:
                   "rakka.agent.decision.kind", "rakka.agent.decision.reason",
                   "rakka.agent.decision.source", "rakka.agent.delegation.id",
                   "rakka.agent.effect.attempt", "rakka.agent.effect.kind",
-                  "rakka.agent.effect.safety", "rakka.agent.effect.status", "rakka.agent.goal.id",
+                  "rakka.agent.effect.safety", "rakka.agent.effect.status",
+                  "rakka.agent.fan_in.policy", "rakka.agent.fan_in.resolution", "rakka.agent.goal.id",
                   "rakka.agent.loop.phase", "rakka.agent.loop.transitions",
                   "rakka.agent.memory.tier", "rakka.agent.model.cached_input_tokens",
                   "rakka.agent.model.reasoning_tokens", "rakka.agent.settings_revision",
-                  "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.error.code"])
+                  "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.agent.wait.kind",
+                  "rakka.error.code"])
                 where instrumentation_scope.name == "rakka.agent"
         log_statements:
           - context: log
@@ -348,11 +350,13 @@ data:
                   "rakka.agent.decision.kind", "rakka.agent.decision.reason",
                   "rakka.agent.decision.source", "rakka.agent.delegation.id",
                   "rakka.agent.effect.attempt", "rakka.agent.effect.kind",
-                  "rakka.agent.effect.safety", "rakka.agent.effect.status", "rakka.agent.goal.id",
+                  "rakka.agent.effect.safety", "rakka.agent.effect.status",
+                  "rakka.agent.fan_in.policy", "rakka.agent.fan_in.resolution", "rakka.agent.goal.id",
                   "rakka.agent.loop.phase", "rakka.agent.loop.transitions",
                   "rakka.agent.memory.tier", "rakka.agent.model.cached_input_tokens",
                   "rakka.agent.model.reasoning_tokens", "rakka.agent.settings_revision",
-                  "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.error.code", "redaction",
+                  "rakka.agent.task.id", "rakka.agent.turn.index", "rakka.agent.wait.kind",
+                  "rakka.error.code", "redaction",
                   "run_id", "step_id", "tenant_id", "workflow_id", "workflow_type"])
         metric_statements:
           - context: datapoint

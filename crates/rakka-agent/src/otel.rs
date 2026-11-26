@@ -159,6 +159,14 @@ pub const ATTR_RAKKA_AGENT_EFFECT_ATTEMPT: &str = crate::observability::SEGMENT_
 /// Rakka attribute: the bounded checkpoint kind a park opened.
 pub const ATTR_RAKKA_AGENT_CHECKPOINT_KIND: &str =
     crate::observability::SEGMENT_ATTR_CHECKPOINT_KIND;
+/// Rakka attribute: the bounded wait kind of a run's park or its resolution.
+pub const ATTR_RAKKA_AGENT_WAIT_KIND: &str = crate::observability::SEGMENT_ATTR_WAIT_KIND;
+/// Rakka attribute: the bounded policy of the fan-in group a run parked on.
+pub const ATTR_RAKKA_AGENT_FAN_IN_POLICY: &str = crate::observability::SEGMENT_ATTR_FAN_IN_POLICY;
+/// Rakka attribute: the bounded resolution code of the fan-in group a run's
+/// wait resolved.
+pub const ATTR_RAKKA_AGENT_FAN_IN_RESOLUTION: &str =
+    crate::observability::SEGMENT_ATTR_FAN_IN_RESOLUTION;
 /// Rakka attribute: the bounded A2A operation class of an ingress segment.
 pub const ATTR_RAKKA_AGENT_A2A_OPERATION: &str = "rakka.agent.a2a.operation";
 /// Rakka attribute: the bounded memory tier of a memory segment.
@@ -223,6 +231,8 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_RAKKA_AGENT_EFFECT_KIND,
     ATTR_RAKKA_AGENT_EFFECT_SAFETY,
     ATTR_RAKKA_AGENT_EFFECT_STATUS,
+    ATTR_RAKKA_AGENT_FAN_IN_POLICY,
+    ATTR_RAKKA_AGENT_FAN_IN_RESOLUTION,
     ATTR_RAKKA_AGENT_GOAL_ID,
     ATTR_RAKKA_AGENT_LOOP_PHASE,
     ATTR_RAKKA_AGENT_LOOP_TRANSITIONS,
@@ -232,6 +242,7 @@ pub const AGENT_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     ATTR_RAKKA_AGENT_SETTINGS_REVISION,
     ATTR_RAKKA_AGENT_TASK_ID,
     ATTR_RAKKA_AGENT_TURN_INDEX,
+    ATTR_RAKKA_AGENT_WAIT_KIND,
     ATTR_RAKKA_ERROR_CODE,
 ];
 
@@ -483,6 +494,11 @@ pub enum AgentGenAiOperation {
     RunResume,
     /// Recovering a run after restart, passivation, or shard movement.
     RunRecover,
+    /// Parking a run on a durable wait; the span ends at the durable park.
+    RunWait,
+    /// The transition that ends a run's durable wait; the span links the park
+    /// and the trigger.
+    RunWaitResolve,
     /// A fail-closed autonomy admission check.
     AutonomyAdmit,
     /// A dispatch-time budget reservation.
@@ -524,6 +540,8 @@ impl AgentGenAiOperation {
             Self::CheckpointResolve => "rakka.agent.checkpoint.resolve".to_string(),
             Self::RunResume => "rakka.agent.run.resume".to_string(),
             Self::RunRecover => "rakka.agent.run.recover".to_string(),
+            Self::RunWait => "rakka.agent.run.wait".to_string(),
+            Self::RunWaitResolve => "rakka.agent.run.wait.resolve".to_string(),
             Self::AutonomyAdmit => "rakka.agent.autonomy.admit".to_string(),
             Self::BudgetReserve => "rakka.agent.budget.reserve".to_string(),
             Self::BudgetSettle => "rakka.agent.budget.settle".to_string(),
@@ -568,6 +586,8 @@ impl AgentGenAiOperation {
             | Self::CheckpointResolve
             | Self::RunResume
             | Self::RunRecover
+            | Self::RunWait
+            | Self::RunWaitResolve
             | Self::AutonomyAdmit
             | Self::BudgetReserve
             | Self::BudgetSettle
@@ -660,6 +680,8 @@ pub fn genai_operation(operation: &AgentSegmentOperation) -> AgentGenAiOperation
         AgentSegmentOperation::CheckpointResolve => AgentGenAiOperation::CheckpointResolve,
         AgentSegmentOperation::RunResume => AgentGenAiOperation::RunResume,
         AgentSegmentOperation::RunRecover => AgentGenAiOperation::RunRecover,
+        AgentSegmentOperation::Wait { .. } => AgentGenAiOperation::RunWait,
+        AgentSegmentOperation::WaitResolve { .. } => AgentGenAiOperation::RunWaitResolve,
     }
 }
 
@@ -1380,6 +1402,16 @@ mod tests {
             (
                 AgentGenAiOperation::RunRecover,
                 "rakka.agent.run.recover",
+                AgentOtelSpanKind::Internal,
+            ),
+            (
+                AgentGenAiOperation::RunWait,
+                "rakka.agent.run.wait",
+                AgentOtelSpanKind::Internal,
+            ),
+            (
+                AgentGenAiOperation::RunWaitResolve,
+                "rakka.agent.run.wait.resolve",
                 AgentOtelSpanKind::Internal,
             ),
             (

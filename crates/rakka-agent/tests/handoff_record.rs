@@ -293,6 +293,35 @@ async fn session_refusal_code(
 
 /// Every interception refusal is a failed tool result under its stable code;
 /// the run survives, corrects course on the next turn, and holds no cell.
+/// Issue #70: a run resting on its handoff stands on `AwaitingChildren`,
+/// but a handoff is no child wait, and it closes no `wait` segment.
+#[tokio::test]
+async fn a_handoff_wait_parks_no_wait_segment() {
+    let sink = Arc::new(rakka_agent::InMemoryAgentSegmentSink::new());
+    let fixture = handoff_fixture(
+        StubHandoffExecutor::recorded(),
+        vec![handoff_turn(handoff_arguments())],
+    )
+    .with_segments(sink.clone());
+    create_goal_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("loop state");
+    assert_eq!(loop_state.phase(), AgentLoopPhase::AwaitingChildren);
+    assert!(
+        loop_state.handoff().is_some(),
+        "the run rests on its handoff"
+    );
+    assert!(
+        !sink.operations().contains(&"wait"),
+        "no child wait: {:?}",
+        sink.operations()
+    );
+}
+
 #[tokio::test]
 async fn interception_refusals_fail_the_call_and_the_run_survives() {
     for (turn, code) in [

@@ -93,9 +93,17 @@ pub fn agent_durable_span_identity(
 /// Link-kind value: the parked `checkpoint-open` span a resolution resumes
 /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
 pub const LINK_KIND_PARKED_CHECKPOINT: &str = "parked-checkpoint";
-/// Link-kind value: the incoming human or service request span whose command
-/// resolved a checkpoint ([17.11](../../../docs/plans/rakka-agent/spec.md)).
+/// Link-kind value: the incoming request, exchange or timer span that caused
+/// a resume: the human or service request whose command resolved a
+/// checkpoint ([17.11](../../../docs/plans/rakka-agent/spec.md)), or the
+/// child's result, the relay's workflow result or the scheduler's deadline
+/// that resolved a child wait ([17.5](../../../docs/plans/rakka-agent/spec.md),
+/// issue #70).
 pub const LINK_KIND_RESUME_REQUEST: &str = "resume-request";
+/// Link-kind value: the parked `wait` span a child wait's resolution ends,
+/// linked by the identity both derive from the run's context and the fan-in
+/// group ([17.5](../../../docs/plans/rakka-agent/spec.md), issue #70).
+pub const LINK_KIND_PARKED_WAIT: &str = "parked-wait";
 /// Link-kind value: the dispatch attempt whose outcome could not be
 /// established ([17.9](../../../docs/plans/rakka-agent/spec.md)).
 pub const LINK_KIND_AMBIGUOUS_ATTEMPT: &str = "ambiguous-attempt";
@@ -146,6 +154,7 @@ pub fn agent_linked_telemetry_context(
 pub const AGENT_TELEMETRY_LINK_KINDS: &[&str] = &[
     crate::effect::LINK_KIND_SUPERSEDED_GENERATION,
     LINK_KIND_PARKED_CHECKPOINT,
+    LINK_KIND_PARKED_WAIT,
     LINK_KIND_RESUME_REQUEST,
     LINK_KIND_AMBIGUOUS_ATTEMPT,
     LINK_KIND_RECONCILIATION_DECISION,
@@ -1957,7 +1966,32 @@ pub enum AgentSegmentOperation {
     RunResume,
     /// Recovering a run after restart, passivation, or shard movement.
     RunRecover,
+    /// Parking a run on a durable wait that is not a checkpoint; the segment
+    /// ends at the durable park
+    /// ([specification 17.4](../../../docs/plans/rakka-agent/spec.md): a
+    /// "checkpoint/timer park and later resume" is a bounded segment of its
+    /// own). Its identity is derived from the run's context and the wait's
+    /// own record, so the transition that ends the wait links to it without
+    /// either storing it.
+    Wait {
+        /// The bounded wait kind: [`AGENT_WAIT_KIND_CHILDREN`] for a fan-in
+        /// group, the only one written today.
+        kind: &'static str,
+    },
+    /// The transition that ends a [`Self::Wait`]: the child wait's
+    /// counterpart to [`Self::CheckpointResolve`]. It closes on the call whose
+    /// transition ended the wait, whatever the work after it did, and links
+    /// the park and the trigger that caused it
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+    WaitResolve {
+        /// The bounded wait kind, as on the park.
+        kind: &'static str,
+    },
 }
+
+/// Wait-kind value: a run parked on its closed, unresolved fan-in group
+/// ([`AgentSegmentOperation::Wait`]).
+pub const AGENT_WAIT_KIND_CHILDREN: &str = "children";
 
 impl AgentSegmentOperation {
     /// Stable kebab-case class label, for logs and bounded metric labels.
@@ -1993,6 +2027,8 @@ impl AgentSegmentOperation {
             Self::CheckpointResolve => "checkpoint-resolve",
             Self::RunResume => "run-resume",
             Self::RunRecover => "run-recover",
+            Self::Wait { .. } => "wait",
+            Self::WaitResolve { .. } => "wait-resolve",
         }
     }
 }
@@ -2322,6 +2358,16 @@ pub const SEGMENT_ATTR_LOOP_TRANSITIONS: &str = "rakka.agent.loop.transitions";
 
 /// Segment attribute: the bounded checkpoint kind a park opened.
 pub const SEGMENT_ATTR_CHECKPOINT_KIND: &str = "rakka.agent.checkpoint.kind";
+/// Segment attribute: the bounded wait kind of a `wait` or `wait-resolve`
+/// segment ([`AGENT_WAIT_KIND_CHILDREN`]).
+pub const SEGMENT_ATTR_WAIT_KIND: &str = "rakka.agent.wait.kind";
+/// Segment attribute: the bounded policy of the fan-in group a run parked on
+/// (`all`, `any`, `quorum`).
+pub const SEGMENT_ATTR_FAN_IN_POLICY: &str = "rakka.agent.fan_in.policy";
+/// Segment attribute: the bounded resolution code of the fan-in group a
+/// `wait-resolve` segment resolved, the codes
+/// [`METRIC_AGENT_FAN_IN_RESOLUTIONS`] counts.
+pub const SEGMENT_ATTR_FAN_IN_RESOLUTION: &str = "rakka.agent.fan_in.resolution";
 
 /// Measures one *live* bounded operation — a transition, a dispatch attempt,
 /// a provider call — and closes it into a segment.
