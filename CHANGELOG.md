@@ -680,6 +680,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 ### Validation
 
 - `rakka-agent-knowledge-graph`: the conformance suite gains `retention_leaves_a_claim_that_moves_between_its_two_reads` (issue #137). The retention sweep reads the end of a claim's history before it acts on what its query returned, and no clause moved a claim between the two. The clause moves three, on both backends: one retracted, one deleted, one promoted out of `Proposed`. It holds that each is counted `moved`, none `damaged`, and that no delete is sent.
+- `rakka-agent-knowledge-graph`: `tests/live_claim_encoding.rs` pins a live claim's encoding to the bytes the build before tombstones (`d12b0f8`) wrote, and `rakka-agent-knowledge-graph-postgres` holds the bytes it stores to that encoding (issue #139). The promise in `docs/rakka-compatibility.md` that a live claim "encodes to the same bytes as before" had no test that compared against earlier bytes: the existing ones compared parsed JSON, which ignores key order, and would have passed a renamed key or a new field.
 - CI's PostgreSQL job sets `RAKKA_POSTGRES_PGVECTOR_REQUIRED=1`, so a pgvector clause of `rakka-agent-postgres` or `rakka-agent-knowledge-graph-postgres` that skips fails the build (issue #140).
 - Required validation: `scripts/validate.sh`.
 - Packaging validation: `scripts/package-check.sh` in Cargo offline mode.
