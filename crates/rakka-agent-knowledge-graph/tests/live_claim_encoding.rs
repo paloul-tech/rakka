@@ -13,7 +13,10 @@
 //! them through both doors. The furnished edge claim sets every optional
 //! field; the two value claims leave them unset, so the `Some` and the empty
 //! encodings are both held, and each object shape a live claim can take is
-//! held once. Inline JSON in a fixture keeps its keys in sorted order, so the
+//! held once. The verified and retracted claims complete the spellings: with
+//! the others, the five hold every trust status, every classification, every
+//! artifact kind and every redaction status, so renaming any one variant
+//! fails here. Inline JSON in a fixture keeps its keys in sorted order, so the
 //! bytes do not depend on `serde_json`'s `preserve_order` feature.
 //!
 //! The PostgreSQL backend's side is
@@ -169,6 +172,101 @@ fn artifact_value_claim() -> Claim {
     .expect("the claim is valid")
 }
 
+/// An artifact reference with every optional field unset.
+fn spelled_artifact(id: &str, kind: ArtifactKind, redaction: RedactionStatus) -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: id.to_string(),
+        kind,
+        uri: format!("s3://evidence/{id}"),
+        checksum: None,
+        content_type: None,
+        byte_len: None,
+        retention_class: None,
+        encryption: None,
+        redaction,
+        created_at: AgentTimestampMillis::new(1_700_000_000_000),
+        metadata: AgentAttributes::new(),
+    }
+}
+
+/// A verified claim that spells, between its evidence, classification and
+/// inline value, every artifact kind, every redaction status, the redacted
+/// classification, and a float, a boolean, a null and escaped characters.
+fn verified_claim() -> Claim {
+    let kinds = [
+        ArtifactKind::Input,
+        ArtifactKind::Prompt,
+        ArtifactKind::Completion,
+        ArtifactKind::File,
+        ArtifactKind::Embedding,
+        ArtifactKind::ToolOutput,
+        ArtifactKind::Screenshot,
+        ArtifactKind::Log,
+        ArtifactKind::State,
+        ArtifactKind::Other,
+    ];
+    let redactions = [
+        RedactionStatus::Unknown,
+        RedactionStatus::Unredacted,
+        RedactionStatus::Redacted,
+        RedactionStatus::ReferenceOnly,
+    ];
+    let evidence = kinds
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            spelled_artifact(
+                &format!("e{index}"),
+                kind,
+                redactions[index % redactions.len()],
+            )
+        })
+        .collect();
+    let content = AgentTaskContent::inline(json!({
+        "confidence": 0.875,
+        "language": "fr \"Québec\" \\ x\n\u{7}",
+        "native": true,
+        "notes": null
+    }))
+    .expect("the inline content is within bounds");
+    Claim::new(
+        &scope(),
+        append("verified-claim"),
+        node("customer-2"),
+        predicate("speaks"),
+        ClaimObject::Value(content),
+        provenance(),
+        8_000,
+        MemoryClassification::Redacted,
+        AgentTimestampMillis::new(1_700_000_000_004),
+    )
+    .expect("the claim is valid")
+    .with_evidence(evidence)
+    .expect("the evidence is within bounds")
+    .apply_transition(ClaimTrustStatus::Verified)
+    .expect("the verification applies")
+}
+
+/// A retracted claim, the trust status's terminal spelling.
+fn retracted_claim() -> Claim {
+    Claim::new(
+        &scope(),
+        append("retracted-claim"),
+        node("customer-3"),
+        predicate("prefers"),
+        ClaimObject::Node(node("channel-phone")),
+        provenance(),
+        5_000,
+        MemoryClassification::Unclassified,
+        AgentTimestampMillis::new(1_700_000_000_005),
+    )
+    .expect("the claim is valid")
+    .apply_transition(ClaimTrustStatus::Disputed)
+    .expect("the dispute applies")
+    .apply_transition(ClaimTrustStatus::Retracted)
+    .expect("the retraction applies")
+}
+
 // ---- The bytes the build at d12b0f8 wrote ----
 //
 // Printed by running everything above this line, unchanged, at `d12b0f8`.
@@ -178,6 +276,8 @@ fn artifact_value_claim() -> Claim {
 const FURNISHED_EDGE_CLAIM: &str = r#"{"schema_version":1,"claim_id":"claim-d14f9e1d1e4d581453ec500e3079c9304187c3287e65fb9b26ed1b942a39e31b","operation_id":"claim-op-41769795f4bb17f2d2258f958a0e8817a8632cd73c5cb0a8480f8c54fefb7cfe","subject":"customer-1","predicate":"prefers","object":{"node":"channel-email"},"content_digest":{"algorithm":"fnv1a128","value":"a8cf971c9e8377182ca8b4781becb100"},"provenance":{"agent":"scout","goal":"goal-1","task":"task-1","run":"task-1-gen-1","delegation":"delegation-1","effect":"effect-1"},"evidence":[{"artifact_id":"a","kind":"file","uri":"s3://evidence/a","checksum":"sha256:a","content_type":"application/json","byte_len":64,"retention_class":"legal-hold-7y","encryption":{"algorithm":"aes-256-gcm","key_ref":"kms://keys/evidence","context":{"purpose":"evidence"}},"redaction":"redacted","created_at":1700000000000,"metadata":{"source":"ticket-system"}},{"artifact_id":"b","kind":"file","uri":"s3://evidence/b","checksum":"sha256:b","content_type":"application/json","byte_len":64,"retention_class":"legal-hold-7y","encryption":{"algorithm":"aes-256-gcm","key_ref":"kms://keys/evidence","context":{"purpose":"evidence"}},"redaction":"redacted","created_at":1700000000000,"metadata":{"source":"ticket-system"}}],"created_at":1700000000001,"confidence_bps":7500,"classification":"sensitive","access":{"required_read_capabilities":["read-pii","read-support"]},"trust":"disputed","transition_count":1,"embedding":{"model":"embedder-v1","dimensions":3,"version":2},"policy":"retention-v1","policy_revision":3}"#;
 const INLINE_VALUE_CLAIM: &str = r#"{"schema_version":1,"claim_id":"claim-b131eabd63380ba7f856f58bf4c12aed893215ad4367aeabf932a3eb32cbd66d","operation_id":"claim-op-3e7b090c3c34d05693ace4bd38b085733616cbb4de95322150d10f28efa71a9e","subject":"customer-1","predicate":"prefers-hours","object":{"value":{"inline":{"days":["mon","tue"],"since":2024,"window":{"end":"17:00","start":"09:00"}}}},"content_digest":{"algorithm":"fnv1a128","value":"905bb49f5ba28a5764ec1462043fdb23"},"provenance":{"agent":"scout","goal":null,"task":null,"run":null,"delegation":null,"effect":null},"evidence":[],"created_at":1700000000002,"confidence_bps":6000,"classification":"unclassified","access":{"required_read_capabilities":[]},"trust":"proposed","transition_count":0,"embedding":null,"policy":null,"policy_revision":null}"#;
 const ARTIFACT_VALUE_CLAIM: &str = r#"{"schema_version":1,"claim_id":"claim-7a41cf1ac04ef3e4f8f156a30864961980cbeb06f2a33e09984013c540eb06d5","operation_id":"claim-op-2f0e6a3090df5756f48f52d2b35ddac6a4e6da7bf013837b4c69dac44659f067","subject":"customer-1","predicate":"has-contract","object":{"value":{"artifact":{"artifact_id":"contract","kind":"file","uri":"s3://evidence/contract","checksum":"sha256:contract","content_type":"application/json","byte_len":64,"retention_class":"legal-hold-7y","encryption":{"algorithm":"aes-256-gcm","key_ref":"kms://keys/evidence","context":{"purpose":"evidence"}},"redaction":"redacted","created_at":1700000000000,"metadata":{"source":"ticket-system"}}}},"content_digest":{"algorithm":"fnv1a128","value":"867753198b79780574dc3c9d6fdf3e97"},"provenance":{"agent":"scout","goal":null,"task":null,"run":null,"delegation":null,"effect":null},"evidence":[],"created_at":1700000000003,"confidence_bps":9000,"classification":"unclassified","access":{"required_read_capabilities":[]},"trust":"proposed","transition_count":0,"embedding":null,"policy":null,"policy_revision":null}"#;
+const VERIFIED_CLAIM: &str = r#"{"schema_version":1,"claim_id":"claim-450653030100c2dc50ea4ddc0a36c8337206becca8b96c51d201edfc46fc533d","operation_id":"claim-op-bda60d93cf11e2c32c0ba48fa3a9ad91ae87ab03236f888c489b2e012b6be592","subject":"customer-2","predicate":"speaks","object":{"value":{"inline":{"confidence":0.875,"language":"fr \"Québec\" \\ x\n\u0007","native":true,"notes":null}}},"content_digest":{"algorithm":"fnv1a128","value":"e52f1569ca61a215de3d0e7012d685b2"},"provenance":{"agent":"scout","goal":null,"task":null,"run":null,"delegation":null,"effect":null},"evidence":[{"artifact_id":"e0","kind":"input","uri":"s3://evidence/e0","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"unknown","created_at":1700000000000,"metadata":{}},{"artifact_id":"e1","kind":"prompt","uri":"s3://evidence/e1","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"unredacted","created_at":1700000000000,"metadata":{}},{"artifact_id":"e2","kind":"completion","uri":"s3://evidence/e2","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"redacted","created_at":1700000000000,"metadata":{}},{"artifact_id":"e3","kind":"file","uri":"s3://evidence/e3","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"reference-only","created_at":1700000000000,"metadata":{}},{"artifact_id":"e4","kind":"embedding","uri":"s3://evidence/e4","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"unknown","created_at":1700000000000,"metadata":{}},{"artifact_id":"e5","kind":"tool-output","uri":"s3://evidence/e5","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"unredacted","created_at":1700000000000,"metadata":{}},{"artifact_id":"e6","kind":"screenshot","uri":"s3://evidence/e6","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"redacted","created_at":1700000000000,"metadata":{}},{"artifact_id":"e7","kind":"log","uri":"s3://evidence/e7","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"reference-only","created_at":1700000000000,"metadata":{}},{"artifact_id":"e8","kind":"state","uri":"s3://evidence/e8","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"unknown","created_at":1700000000000,"metadata":{}},{"artifact_id":"e9","kind":"other","uri":"s3://evidence/e9","checksum":null,"content_type":null,"byte_len":null,"retention_class":null,"encryption":null,"redaction":"unredacted","created_at":1700000000000,"metadata":{}}],"created_at":1700000000004,"confidence_bps":8000,"classification":"redacted","access":{"required_read_capabilities":[]},"trust":"verified","transition_count":1,"embedding":null,"policy":null,"policy_revision":null}"#;
+const RETRACTED_CLAIM: &str = r#"{"schema_version":1,"claim_id":"claim-f81093ba4666d85d2347cda56e095231e97f570afaca1d4868365ad12383f7b8","operation_id":"claim-op-595e4bb71fddb5c00912e051eb5d89d75cb5191381a79e2a45abf7277e256ab4","subject":"customer-3","predicate":"prefers","object":{"node":"channel-phone"},"content_digest":{"algorithm":"fnv1a128","value":"04af76daad525acf31a41fbbab6aa54a"},"provenance":{"agent":"scout","goal":null,"task":null,"run":null,"delegation":null,"effect":null},"evidence":[],"created_at":1700000000005,"confidence_bps":5000,"classification":"unclassified","access":{"required_read_capabilities":[]},"trust":"retracted","transition_count":2,"embedding":null,"policy":null,"policy_revision":null}"#;
 
 use rakka_agent_knowledge_graph::{ClaimRecord, CLAIM_LIVE_SCHEMA_VERSION};
 
@@ -250,4 +350,22 @@ fn an_artifact_value_claim_encodes_to_the_bytes_written_before_tombstones() {
         &artifact_value_claim(),
         ARTIFACT_VALUE_CLAIM,
     );
+}
+
+#[test]
+fn a_verified_claim_encodes_to_the_bytes_written_before_tombstones() {
+    let claim = verified_claim();
+    // The fixture keeps spelling what it says it does.
+    assert_eq!(claim.trust(), ClaimTrustStatus::Verified);
+    assert_eq!(claim.classification, MemoryClassification::Redacted);
+    assert_eq!(claim.evidence.len(), 10, "one artifact of every kind");
+    assert_pinned("verified claim", &claim, VERIFIED_CLAIM);
+}
+
+#[test]
+fn a_retracted_claim_encodes_to_the_bytes_written_before_tombstones() {
+    let claim = retracted_claim();
+    assert_eq!(claim.trust(), ClaimTrustStatus::Retracted);
+    assert_eq!(claim.transition_count(), 2);
+    assert_pinned("retracted claim", &claim, RETRACTED_CLAIM);
 }
