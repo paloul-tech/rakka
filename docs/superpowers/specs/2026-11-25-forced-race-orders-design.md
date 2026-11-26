@@ -80,20 +80,31 @@ each step is really "up to about a millisecond, by timer phase". Across the
 
 ### 5.1 Shared helpers (in the test file)
 
-- `session_store() -> (PostgresKnowledgeGraphStore, i32)`: a store on its
-  own session, built with `from_shared_client`, with that session's backend
-  id.
-- `until_waiting_for_a_lock(observer, pid)`: polls `pg_locks` for an
-  ungranted lock held by `pid`, panicking after a bound (about ten
-  seconds). Copied from the damaged-history file; test files share no
-  module.
+- **Every forced proof runs in a private schema of its own** (amended while
+  planning). Every other proof in the file calls `migrate()` on the shared
+  schema at its start, and a repeat migration takes a brief `SHARE` lock on
+  the claim table (`CREATE INDEX IF NOT EXISTS`). Such a lock request,
+  queued ahead of a writer, can let the two writers reach the row together
+  after the release, or leave a proof waiting on a migrator that waits on
+  the proof. No other proof migrates or writes a private schema, so the
+  only locks in it are the proof's own.
+- A world of three store sessions (the first writer, the second writer, the
+  holder), each with its backend id, and an observer session, all in that
+  schema; dropped at the end.
+- `until_blocked_by(observer, waiter, blocker)`: polls
+  `$2 = ANY(pg_blocking_pids($1))` until it holds, panicking after a bound
+  (about ten seconds) with both ids in the message. This is stricter than
+  the damaged-history file's "any ungranted lock": a first writer blocked by
+  the holder is at the row and holds its tuple lock, so it is first in the
+  queue.
 - `hold_claim_row(holder, scope, claim_id)`: `BEGIN` plus
   `SELECT 1 FROM rakka_agent_knowledge_claim WHERE … FOR UPDATE`; released
   by `COMMIT`.
-- `queued_in_order(first, second)`: given two store calls on two sessions,
-  holds the row, starts `first`, waits until it is queued, starts `second`,
-  waits until it is queued, commits, and returns both answers. Both have
-  read the claim before either writes.
+- `queued_in_order(first, second)`: given two store calls on the first and
+  second sessions, holds the row, starts `first`, waits until it is blocked
+  by the holder, starts `second`, waits until it is blocked by the first,
+  commits, and returns both answers. Both have read the claim before either
+  writes.
 
 ### 5.2 Tombstone against transition, and delete against transition
 
@@ -133,11 +144,12 @@ proof that panics leaves it behind.
 
 ### 5.4 The two pause-based proofs
 
-`BLOCKED_WRITER_PAUSE` is removed. Each proof builds its store with
-`session_store` and, where it slept, waits with `until_waiting_for_a_lock`
-until the store's session is queued: the duplicate append on the original's
-uncommitted claim row, the second delete or tombstone on the uncommitted
-ledger row. Their assertions do not change.
+`BLOCKED_WRITER_PAUSE` is removed. Each proof moves into a private world,
+runs its raw transaction on the holder session, and, where it slept, waits
+with `until_blocked_by` until the store's session is blocked by the holder:
+the duplicate append on the original's uncommitted claim row, the second
+delete or tombstone on the uncommitted ledger row. Their assertions do not
+change.
 
 ### 5.5 Falsification
 
