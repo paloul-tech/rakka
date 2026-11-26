@@ -1957,7 +1957,32 @@ pub enum AgentSegmentOperation {
     RunResume,
     /// Recovering a run after restart, passivation, or shard movement.
     RunRecover,
+    /// Parking a run on a durable wait that is not a checkpoint; the segment
+    /// ends at the durable park
+    /// ([specification 17.4](../../../docs/plans/rakka-agent/spec.md): a
+    /// "checkpoint/timer park and later resume" is a bounded segment of its
+    /// own). Its identity is derived from the run's context and the wait's
+    /// own record, so the transition that ends the wait links to it without
+    /// either storing it.
+    Wait {
+        /// The bounded wait kind: [`AGENT_WAIT_KIND_CHILDREN`] for a fan-in
+        /// group, the only one written today.
+        kind: &'static str,
+    },
+    /// The transition that ends a [`Self::Wait`]: the child wait's
+    /// counterpart to [`Self::CheckpointResolve`]. It closes on the call whose
+    /// transition ended the wait, whatever the work after it did, and links
+    /// the park and the trigger that caused it
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+    WaitResolve {
+        /// The bounded wait kind, as on the park.
+        kind: &'static str,
+    },
 }
+
+/// Wait-kind value: a run parked on its closed, unresolved fan-in group
+/// ([`AgentSegmentOperation::Wait`]).
+pub const AGENT_WAIT_KIND_CHILDREN: &str = "children";
 
 impl AgentSegmentOperation {
     /// Stable kebab-case class label, for logs and bounded metric labels.
@@ -1993,6 +2018,8 @@ impl AgentSegmentOperation {
             Self::CheckpointResolve => "checkpoint-resolve",
             Self::RunResume => "run-resume",
             Self::RunRecover => "run-recover",
+            Self::Wait { .. } => "wait",
+            Self::WaitResolve { .. } => "wait-resolve",
         }
     }
 }

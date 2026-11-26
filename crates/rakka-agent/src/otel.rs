@@ -483,6 +483,11 @@ pub enum AgentGenAiOperation {
     RunResume,
     /// Recovering a run after restart, passivation, or shard movement.
     RunRecover,
+    /// Parking a run on a durable wait; the span ends at the durable park.
+    RunWait,
+    /// The transition that ends a run's durable wait; the span links the park
+    /// and the trigger.
+    RunWaitResolve,
     /// A fail-closed autonomy admission check.
     AutonomyAdmit,
     /// A dispatch-time budget reservation.
@@ -524,6 +529,8 @@ impl AgentGenAiOperation {
             Self::CheckpointResolve => "rakka.agent.checkpoint.resolve".to_string(),
             Self::RunResume => "rakka.agent.run.resume".to_string(),
             Self::RunRecover => "rakka.agent.run.recover".to_string(),
+            Self::RunWait => "rakka.agent.run.wait".to_string(),
+            Self::RunWaitResolve => "rakka.agent.run.wait.resolve".to_string(),
             Self::AutonomyAdmit => "rakka.agent.autonomy.admit".to_string(),
             Self::BudgetReserve => "rakka.agent.budget.reserve".to_string(),
             Self::BudgetSettle => "rakka.agent.budget.settle".to_string(),
@@ -568,6 +575,8 @@ impl AgentGenAiOperation {
             | Self::CheckpointResolve
             | Self::RunResume
             | Self::RunRecover
+            | Self::RunWait
+            | Self::RunWaitResolve
             | Self::AutonomyAdmit
             | Self::BudgetReserve
             | Self::BudgetSettle
@@ -660,6 +669,8 @@ pub fn genai_operation(operation: &AgentSegmentOperation) -> AgentGenAiOperation
         AgentSegmentOperation::CheckpointResolve => AgentGenAiOperation::CheckpointResolve,
         AgentSegmentOperation::RunResume => AgentGenAiOperation::RunResume,
         AgentSegmentOperation::RunRecover => AgentGenAiOperation::RunRecover,
+        AgentSegmentOperation::Wait { .. } => AgentGenAiOperation::RunWait,
+        AgentSegmentOperation::WaitResolve { .. } => AgentGenAiOperation::RunWaitResolve,
     }
 }
 
@@ -1380,6 +1391,16 @@ mod tests {
             (
                 AgentGenAiOperation::RunRecover,
                 "rakka.agent.run.recover",
+                AgentOtelSpanKind::Internal,
+            ),
+            (
+                AgentGenAiOperation::RunWait,
+                "rakka.agent.run.wait",
+                AgentOtelSpanKind::Internal,
+            ),
+            (
+                AgentGenAiOperation::RunWaitResolve,
+                "rakka.agent.run.wait.resolve",
                 AgentOtelSpanKind::Internal,
             ),
             (

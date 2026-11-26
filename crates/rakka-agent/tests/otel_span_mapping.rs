@@ -27,11 +27,12 @@ use rakka_agent::{
     AgentRunEffect, AgentRunEffectRequest, AgentSegmentIdentity, AgentSegmentOperation,
     AgentSegmentSink, AgentSegmentTimer, AgentTaskContent, AgentTelemetrySegment, AgentToolCallId,
     AgentToolCallRequest, AgentToolId, AGENT_GENAI_CONVENTION_REVISION, AGENT_OTEL_SCOPE_NAME,
-    AGENT_SPAN_ATTRIBUTE_KEYS, ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID, ATTR_GEN_AI_CONVERSATION_ID,
-    ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
-    ATTR_GEN_AI_RESPONSE_MODEL, ATTR_GEN_AI_TOOL_NAME, ATTR_GEN_AI_TOOL_TYPE,
-    ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS, ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS,
-    ATTR_RAKKA_ERROR_CODE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AGENT_SPAN_ATTRIBUTE_KEYS, AGENT_WAIT_KIND_CHILDREN, ATTR_ERROR_TYPE, ATTR_GEN_AI_AGENT_ID,
+    ATTR_GEN_AI_CONVERSATION_ID, ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME,
+    ATTR_GEN_AI_RESPONSE_FINISH_REASONS, ATTR_GEN_AI_RESPONSE_MODEL, ATTR_GEN_AI_TOOL_NAME,
+    ATTR_GEN_AI_TOOL_TYPE, ATTR_RAKKA_AGENT_MODEL_CACHED_INPUT_TOKENS,
+    ATTR_RAKKA_AGENT_MODEL_REASONING_TOKENS, ATTR_RAKKA_ERROR_CODE,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentLogEvent, AgentLogSeverity, AgentOtelResource, AgentOtelSpanKind,
@@ -109,7 +110,41 @@ fn every_operation() -> Vec<AgentSegmentOperation> {
         AgentSegmentOperation::CheckpointResolve,
         AgentSegmentOperation::RunResume,
         AgentSegmentOperation::RunRecover,
+        AgentSegmentOperation::Wait {
+            kind: AGENT_WAIT_KIND_CHILDREN,
+        },
+        AgentSegmentOperation::WaitResolve {
+            kind: AGENT_WAIT_KIND_CHILDREN,
+        },
     ]
+}
+
+/// A child wait's park and its resolution map to the run's wait spans
+/// (issue #70): `INTERNAL`, under stable `rakka.agent.run.*` names that
+/// embed no identifier.
+#[test]
+fn the_child_wait_classes_map_to_the_run_wait_spans() {
+    for (operation, label, name) in [
+        (
+            AgentSegmentOperation::Wait {
+                kind: AGENT_WAIT_KIND_CHILDREN,
+            },
+            "wait",
+            "rakka.agent.run.wait",
+        ),
+        (
+            AgentSegmentOperation::WaitResolve {
+                kind: AGENT_WAIT_KIND_CHILDREN,
+            },
+            "wait-resolve",
+            "rakka.agent.run.wait.resolve",
+        ),
+    ] {
+        assert_eq!(operation.as_label(), label);
+        let mapped = genai_operation(&operation);
+        assert_eq!(mapped.span_name(), name, "{label}");
+        assert_eq!(mapped.span_kind(), AgentOtelSpanKind::Internal, "{label}");
+    }
 }
 
 fn segment(operation: AgentSegmentOperation) -> AgentTelemetrySegment {
