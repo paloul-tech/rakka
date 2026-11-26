@@ -2024,12 +2024,6 @@ async fn postgres_a_same_operation_racer_stopped_between_its_two_reads_answers_t
     drop_world(world).await;
 }
 
-/// How long a proof waits for a store call on another connection to reach the
-/// row lock it is meant to block on. If the call is slower than this the proof
-/// still passes — it then sees the committed state instead of waiting on it —
-/// so the pause can under-exercise the window but never fail it.
-const BLOCKED_WRITER_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
-
 /// Whether the ledger's kind check is validated, when the check exists.
 async fn kind_check_validated(client: &Client) -> Option<bool> {
     client
@@ -2044,7 +2038,7 @@ async fn kind_check_validated(client: &Client) -> Option<bool> {
         .map(|row| row.get(0))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_waited_when_dsn_is_set(
 ) {
     // The narrowest way a deleted claim could come back. A duplicate of an
@@ -2056,17 +2050,24 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
     //
     // The interleaving is made exact by running the original append and the
     // delete's effect in one transaction: when it commits, the waiter sees
-    // precisely "no claim row, an erased ledger row".
-    let Some(store) = store().await else { return };
-    let raw = client().await.expect("a raw connection opens");
-    let observer = client().await.expect("a second raw connection opens");
+    // precisely "no claim row, an erased ledger row". The transaction runs on
+    // the holder's session, and the proof goes on only once the duplicate's
+    // session is blocked by it (issue #136): a duplicate that had not reached
+    // the row yet would see the committed state, and the proof would pass
+    // without the interleaving it is about.
+    let Some(world) = lock_world("duplicate_append").await else {
+        return;
+    };
+    let store = &world.first.store;
+    let raw = &*world.holder.client;
+    let observer = &world.observer;
     let scope = ConformanceScopes::unique("pg-append-waits-on-delete").primary;
     let claim = distinctive_claim(&scope, "restored");
 
     raw.batch_execute("BEGIN")
         .await
         .expect("the transaction opens");
-    let row = earlier_append(&raw, &scope, &claim).await;
+    let row = earlier_append(raw, &scope, &claim).await;
     assert!(row.get::<_, bool>("applied"));
 
     // The duplicate: same operation, same claim, through the real store.
@@ -2076,7 +2077,7 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
         let claim = claim.clone();
         tokio::spawn(async move { store.append(&scope, &claim).await })
     };
-    tokio::time::sleep(BLOCKED_WRITER_PAUSE).await;
+    until_blocked_by(observer, world.first.pid, world.holder.pid).await;
 
     // The delete's effect: the claim row gone, its append erased.
     let key: [&(dyn ToSql + Sync); 3] = [
@@ -2113,7 +2114,7 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
             .code(),
         "claim-operation-erased"
     );
-    let rows = scope_rows(&observer, &scope).await;
+    let rows = scope_rows(observer, &scope).await;
     assert!(
         rows.iter().all(|row| row.starts_with(b"op|")),
         "the deleted claim was not restored"
@@ -2124,9 +2125,10 @@ async fn postgres_a_duplicate_append_cannot_restore_a_claim_deleted_while_it_wai
         .await
         .expect("the read answers")
         .is_none());
+    drop_world(world).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when_dsn_is_set() {
     // An erasure operation id belongs to one claim. The serial case is a
     // conformance clause; this is the concurrent one. A delete under id X is
@@ -2134,9 +2136,18 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
     // committed — when a delete under the same X arrives for this claim. The
     // second must not apply and skip its ledger row: it waits, finds the id
     // spent, and answers a conflict with its claim untouched.
-    let Some(store) = store().await else { return };
-    let raw = client().await.expect("a raw connection opens");
-    let observer = client().await.expect("a second raw connection opens");
+    //
+    // The other claim's ledger row is written on the holder's session, and the
+    // proof commits it only once the second delete's session is blocked by it
+    // (issue #136). A second delete that had not reached the ledger row yet
+    // would find the id already spent and answer the conflict serially, and
+    // the proof would pass without the wait it is about.
+    let Some(world) = lock_world("id_in_flight").await else {
+        return;
+    };
+    let store = &world.first.store;
+    let raw = &*world.holder.client;
+    let observer = &world.observer;
     let scope = ConformanceScopes::unique("pg-id-in-flight").primary;
 
     for (kind, as_tombstone) in [("delete", false), ("delete", true)] {
@@ -2150,7 +2161,7 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
             .append(&scope, &claim)
             .await
             .expect("the claim appends");
-        let before = scope_rows(&observer, &scope).await;
+        let before = scope_rows(observer, &scope).await;
         let shared = ClaimOperationId::derive_delete(&scope, &claim.claim_id, "shared-request")
             .expect("the operation id derives");
 
@@ -2188,7 +2199,7 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
                 }
             })
         };
-        tokio::time::sleep(BLOCKED_WRITER_PAUSE).await;
+        until_blocked_by(observer, world.first.pid, world.holder.pid).await;
         raw.batch_execute("COMMIT")
             .await
             .expect("the transaction commits");
@@ -2196,12 +2207,18 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
         let answered = second.await.expect("the task completes");
         assert_eq!(
             answered
-                .expect_err("an operation id spent on another claim is refused")
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tombstone: {as_tombstone}: an operation id spent on another claim is \
+                         refused"
+                    )
+                })
                 .code(),
             "claim-operation-conflict",
             "tombstone: {as_tombstone}"
         );
-        let after = scope_rows(&observer, &scope).await;
+        let after = scope_rows(observer, &scope).await;
         assert_eq!(
             after.len(),
             before.len() + 1,
@@ -2216,6 +2233,7 @@ async fn postgres_an_operation_id_in_flight_for_another_claim_is_a_conflict_when
             "the claim the reused id named is exactly as it was"
         );
     }
+    drop_world(world).await;
 }
 
 #[tokio::test]
