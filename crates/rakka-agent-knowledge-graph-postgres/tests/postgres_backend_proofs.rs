@@ -5,22 +5,31 @@
 //! the shared semantics; this file proves the properties that need real
 //! durability and real concurrency — replays answering across a reconnect,
 //! genuinely concurrent compare-and-set races over two connections, the
-//! concurrent-migrator race, and fail-closed decoding of doctored rows —
-//! including scenario 33's concurrent specialist appends to one space.
+//! concurrent-migrator race, fail-closed decoding of doctored rows, and the
+//! bytes a live claim is stored as — including scenario 33's concurrent
+//! specialist appends to one space.
 //!
 //! Every test is gated on `RAKKA_POSTGRES_TEST_DSN` and passes silently
 //! without it.
 
+use rakka_agent::{
+    AgentCapabilityId, AgentDelegationId, AgentGoalId, AgentId, AgentPolicyRef,
+    AgentRevisionNumber, AgentRunId, AgentTaskId, MemoryClassification, MemoryEmbeddingRef,
+};
 use rakka_agent_knowledge_graph::conformance::{
     conformance_claim, conformance_resolver, promotion_grant_for, ConformanceScopes,
 };
 use rakka_agent_knowledge_graph::{
-    ClaimNodeId, ClaimOperationId, ClaimPromotionEvidence, ClaimPromotionPolicy,
-    ClaimTransitionCursor, ClaimTrustStatus, ClaimTrustTransitionRequest, KnowledgeGraphStore,
-    KnowledgeSpaceScope, CURRENT_CLAIM_SCHEMA_VERSION,
+    Claim, ClaimAccess, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate,
+    ClaimPromotionEvidence, ClaimPromotionPolicy, ClaimProvenance, ClaimTransitionCursor,
+    ClaimTrustStatus, ClaimTrustTransitionRequest, KnowledgeGraphStore, KnowledgeSpaceScope,
+    CURRENT_CLAIM_SCHEMA_VERSION,
 };
 use rakka_agent_knowledge_graph_postgres::PostgresKnowledgeGraphStore;
-use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
+use rakka_agent_workflow::{
+    AgentAttributes, AgentEffectId, AgentTimestampMillis, ArtifactEncryptionRef, ArtifactKind,
+    ArtifactRef, RedactionStatus, StateSchemaVersion,
+};
 use tokio_postgres::{Client, NoTls};
 
 async fn client() -> Option<Client> {
@@ -529,6 +538,175 @@ async fn postgres_doctored_rows_fail_closed_when_dsn_is_set() {
         .await
         .expect_err("an edited statement under a stale fingerprint fails closed");
     assert_eq!(error.code(), "claim-statement-digest-mismatch");
+}
+
+fn attributes(key: &str, value: &str) -> AgentAttributes {
+    let mut attributes = AgentAttributes::new();
+    attributes.insert(key.to_string(), value.to_string());
+    attributes
+}
+
+/// An artifact reference with every field set.
+fn furnished_artifact(id: &str) -> ArtifactRef {
+    ArtifactRef {
+        artifact_id: id.to_string(),
+        kind: ArtifactKind::File,
+        uri: format!("s3://evidence/{id}"),
+        checksum: Some(format!("sha256:{id}")),
+        content_type: Some("application/json".to_string()),
+        byte_len: Some(64),
+        retention_class: Some("legal-hold-7y".to_string()),
+        encryption: Some(ArtifactEncryptionRef {
+            algorithm: "aes-256-gcm".to_string(),
+            key_ref: "kms://keys/evidence".to_string(),
+            context: attributes("purpose", "evidence"),
+        }),
+        redaction: RedactionStatus::Redacted,
+        created_at: AgentTimestampMillis::new(1_700_000_000_000),
+        metadata: attributes("source", "ticket-system"),
+    }
+}
+
+/// A `Proposed` edge claim in `scope` with every optional field set: the
+/// shape `rakka-agent-knowledge-graph`'s `tests/live_claim_encoding.rs` pins,
+/// less its transition (an append must be `Proposed`). It cannot be that
+/// file's fixture, because the claim id derives from the scope and this
+/// file's scopes are unique per run.
+fn furnished_claim(scope: &KnowledgeSpaceScope) -> Claim {
+    let provenance =
+        ClaimProvenance::for_agent(AgentId::new("scout").expect("the agent id is valid"))
+            .with_goal(AgentGoalId::new("goal-1").expect("the goal id is valid"))
+            .with_task(AgentTaskId::new("task-1").expect("the task id is valid"))
+            .with_run(AgentRunId::new("task-1-gen-1").expect("the run id is valid"))
+            .with_delegation(AgentDelegationId::new("delegation-1").expect("the id is valid"))
+            .with_effect(AgentEffectId::new("effect-1"));
+    let mut access = ClaimAccess::default();
+    for capability in ["read-pii", "read-support"] {
+        access
+            .required_read_capabilities
+            .insert(AgentCapabilityId::new(capability).expect("the capability is valid"));
+    }
+    Claim::new(
+        scope,
+        ClaimOperationId::derive_append(scope, "live-bytes").expect("the operation id derives"),
+        ClaimNodeId::new("customer-1").expect("the node id is valid"),
+        ClaimPredicate::new("prefers").expect("the predicate is valid"),
+        ClaimObject::Node(ClaimNodeId::new("channel-email").expect("the node id is valid")),
+        provenance,
+        7_500,
+        MemoryClassification::Sensitive,
+        AgentTimestampMillis::new(1_700_000_000_001),
+    )
+    .expect("the claim is valid")
+    .with_evidence(vec![furnished_artifact("a"), furnished_artifact("b")])
+    .expect("the evidence is within bounds")
+    .with_embedding(MemoryEmbeddingRef {
+        model: "embedder-v1".to_string(),
+        dimensions: 3,
+        version: AgentRevisionNumber::new(2),
+    })
+    .expect("the embedding is valid")
+    .with_access(access)
+    .expect("the access set is within bounds")
+    .with_policy(
+        AgentPolicyRef::new("retention-v1").expect("the policy ref is valid"),
+        Some(AgentRevisionNumber::new(3)),
+    )
+}
+
+/// The claim row's `record` bytes, read raw.
+async fn stored_record(raw: &Client, scope: &KnowledgeSpaceScope, claim: &Claim) -> Vec<u8> {
+    raw.query_one(
+        "SELECT record FROM rakka_agent_knowledge_claim \
+         WHERE tenant = $1 AND space = $2 AND claim_id = $3",
+        &[
+            &scope.tenant().as_str(),
+            &scope.space().as_str(),
+            &claim.claim_id.as_str(),
+        ],
+    )
+    .await
+    .expect("the claim row reads")
+    .get("record")
+}
+
+#[tokio::test]
+async fn postgres_stores_a_live_claim_as_its_canonical_record_bytes_when_dsn_is_set() {
+    // The backend stores a live claim as its record's `serde_json` bytes, in
+    // the claim row and in the append's ledger row. `tests/live_claim_encoding.rs`
+    // in `rakka-agent-knowledge-graph` holds that encoding to the bytes the
+    // build before tombstones (`d12b0f8`) wrote, so together they hold what a
+    // binary from before #68 reads off this table. Every expected value is
+    // encoded from a claim this test built, never from a decoded row, which
+    // would pass whatever the backend stored.
+    const STORED: &str = "the backend stores a live claim as its record's serde_json bytes, \
+        which tests/live_claim_encoding.rs in rakka-agent-knowledge-graph holds to the \
+        bytes written before tombstones";
+    let Some(store) = store().await else { return };
+    let raw = client().await.expect("a raw connection opens");
+    let scopes = ConformanceScopes::unique("pg-live-bytes");
+    let scope = &scopes.primary;
+    let claim = furnished_claim(scope);
+
+    store
+        .append(scope, &claim)
+        .await
+        .expect("the claim appends");
+    let expected = serde_json::to_vec(&claim.to_record()).expect("the record serializes");
+    assert_eq!(
+        stored_record(&raw, scope, &claim).await,
+        expected,
+        "the claim row: {STORED}"
+    );
+    let ledger = raw
+        .query_one(
+            "SELECT kind, result FROM rakka_agent_knowledge_claim_op \
+             WHERE tenant = $1 AND space = $2 AND operation_id = $3",
+            &[
+                &scope.tenant().as_str(),
+                &scope.space().as_str(),
+                &claim.operation_id.as_str(),
+            ],
+        )
+        .await
+        .expect("the append's ledger row reads");
+    assert_eq!(ledger.get::<_, String>("kind"), "append");
+    assert_eq!(
+        ledger.get::<_, Vec<u8>>("result"),
+        expected,
+        "the append ledger row: {STORED}"
+    );
+
+    // A transition rewrites the record, through its own statement.
+    store
+        .transition(
+            scope,
+            &transition_request(
+                scope,
+                &claim.claim_id,
+                "live-bytes-dispute",
+                ClaimTrustStatus::Disputed,
+            ),
+            &ClaimPromotionPolicy::default(),
+            AgentTimestampMillis::new(10),
+        )
+        .await
+        .expect("the dispute applies");
+    let moved = claim
+        .apply_transition(ClaimTrustStatus::Disputed)
+        .expect("the dispute applies");
+    assert_eq!(
+        stored_record(&raw, scope, &claim).await,
+        serde_json::to_vec(&moved.to_record()).expect("the record serializes"),
+        "the claim row after a transition: {STORED}"
+    );
+    assert_eq!(
+        store
+            .get(scope, &claim.claim_id)
+            .await
+            .expect("the claim reads"),
+        Some(moved)
+    );
 }
 
 #[tokio::test]
