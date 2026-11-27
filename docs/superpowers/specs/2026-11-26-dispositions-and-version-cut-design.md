@@ -57,7 +57,10 @@ The owner picked A.
 
 ### 4.1 Dispositions (`docs/plans/rakka-agent/spec.md`, 21.3)
 
-- **Decision 6, *Disposition (M1)*:** accepted.
+- **Decision 6, *Disposition (M5)*:** accepted. M5 rather than M1 (corrected
+  while planning): the implementation plan assigned this disposition to slice
+  5.1, which reuses slice 4.3's catalog for handoff targets, and it was never
+  recorded.
   - The deployment supplies the A2A agent card. Rakka builds no
     agent-domain card.
   - An application-owned `A2AAgentCatalog` resolves a request to one

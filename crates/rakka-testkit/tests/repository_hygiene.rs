@@ -549,3 +549,43 @@ fn examples_index_names_every_example_package() {
         "the example scan found nothing, so nothing is checked"
     );
 }
+
+/// Every decision in specification 21.3 carries a disposition, so none
+/// reads as open after the code answered it (issue #72).
+#[test]
+fn every_decision_in_the_register_carries_a_disposition() {
+    let spec = read("docs/plans/rakka-agent/spec.md");
+    let section = section_between(
+        &spec,
+        "### 21.3 Open Decisions",
+        "## 22. Initial Acceptance Statement",
+    );
+    let mut decisions: Vec<(u32, String)> = Vec::new();
+    for line in section.lines() {
+        let number = line
+            .split_once(". **")
+            .and_then(|(number, _)| number.parse::<u32>().ok());
+        match number {
+            Some(number) => decisions.push((number, line.to_string())),
+            None => {
+                if let Some((_, text)) = decisions.last_mut() {
+                    text.push('\n');
+                    text.push_str(line);
+                }
+            }
+        }
+    }
+    let numbers: Vec<u32> = decisions.iter().map(|(number, _)| *number).collect();
+    assert!(!numbers.is_empty(), "21.3 lists no decisions");
+    assert_eq!(
+        numbers,
+        (1..=numbers.len() as u32).collect::<Vec<_>>(),
+        "21.3 numbers its decisions consecutively from 1"
+    );
+    let open: Vec<u32> = decisions
+        .iter()
+        .filter(|(_, text)| !text.contains("*Disposition (M"))
+        .map(|(number, _)| *number)
+        .collect();
+    assert!(open.is_empty(), "decisions without a disposition: {open:?}");
+}
