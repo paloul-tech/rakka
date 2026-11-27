@@ -2777,10 +2777,11 @@ its answer. Items without one remain open.
    `io.rakka.agent.id` and task-definition selection to one
    `(AgentId, AgentTaskDefinition)` target and fails closed when nothing
    matches (slice 1.12); `AgentDelegationCatalog` resolves a model-named skill
-   to the concrete agent (slice 4.3); handoff target resolution reuses the
-   catalog (`resolve_handoff_target`, slice 5.1). Every created task has its
-   own `AgentTaskId`, which is the A2A `Task.id` (decision 17), and each
-   assignment generation's run has its own `AgentRunId`
+   to the concrete agent (slice 4.3); a handoff resolves its target through
+   the same `AgentDelegationCatalog`, and the receiving A2A surface gates it
+   through `A2AAgentCatalog` (`resolve_handoff_target`, slice 5.1). Every
+   created task has its own `AgentTaskId`, which is the A2A `Task.id`
+   (decision 17), and each assignment generation's run has its own `AgentRunId`
    (`run_id_for_assignment`, `{task}-gen-{generation}`, slice 1.4); a handoff
    keeps the task, and its target runs under a new generation. The agent card
    itself is the deployment's: `A2AAgentCardBuilder` projects one skill per
