@@ -3285,37 +3285,12 @@ where
         effect_ids: &[AgentEffectId],
         reason: &str,
     ) -> AgentDispatcherResult<()> {
-        for effect_id in effect_ids {
-            let message_id = OutboxMessageId::new(effect_id.as_str());
-            let status = inbox
-                .inner()
-                .state()
-                .map_err(AgentDispatcherError::from)?
-                .outbox_entry(&message_id)
-                .filter(|entry| entry.is_cancellable())
-                .map(OutboxEntry::status);
-            match status {
-                Some(OutboxStatus::Dispatching) => {
-                    inbox
-                        .inner_mut()
-                        .record_outbox_cancelled_in_flight(
-                            &message_id,
-                            DISPATCH_CANCELLED_IN_FLIGHT_LINE,
-                        )
-                        .await
-                        .map_err(AgentDispatcherError::from)?;
-                }
-                Some(_) => {
-                    inbox
-                        .inner_mut()
-                        .record_outbox_cancelled(&message_id, reason)
-                        .await
-                        .map_err(AgentDispatcherError::from)?;
-                }
-                None => {}
-            }
-        }
-        Ok(())
+        // The rule lives in one place, shared with a graph's cancelled nodes
+        // (issue #71 item 4).
+        crate::effect_bridge::settle_cancelled_outbox_entries(inbox, effect_ids, reason)
+            .await
+            .map(|_| ())
+            .map_err(AgentDispatcherError::from)
     }
 
     /// Claims due work for this worker.

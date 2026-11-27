@@ -160,11 +160,13 @@ pub use domain::{
     FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
 };
 pub use effect_bridge::{
-    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectBridgeResult,
-    AgentGraphEffectCommandOutcome, AgentGraphEffectFailureDisposition,
-    AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
-    AgentGraphHumanCheckpointScheduleOutcome, AgentGraphHumanCheckpointScheduleRequest,
-    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest, ATTR_AGENT_EFFECT_SAFETY_CLASS,
+    settle_cancelled_outbox_entries, AgentGraphEffectBridge, AgentGraphEffectBridgeError,
+    AgentGraphEffectBridgeResult, AgentGraphEffectCommandOutcome,
+    AgentGraphEffectFailureDisposition, AgentGraphEffectScheduleOutcome,
+    AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleOutcome,
+    AgentGraphHumanCheckpointScheduleRequest, AgentGraphTimerScheduleOutcome,
+    AgentGraphTimerScheduleRequest, AgentOutboxSettlement, AgentSettledOutboxEntry,
+    ATTR_AGENT_EFFECT_SAFETY_CLASS, GRAPH_NODE_CANCELLED_REASON,
 };
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,
