@@ -2726,10 +2726,11 @@ A follow-up design review (2026-07-10) resolved four additional defaults:
 ### 21.3 Open Decisions
 
 These decisions remain open until accepted by maintainers and product owners.
-The current recommended default is shown after each question. Decisions
-confirmed or exercised during Phase 1 (M1) carry an inline *Disposition (M1)*
-note naming the implementation-plan slice that recorded the resolution; items
-without one remain open.
+The current recommended default is shown after each question. A decision
+confirmed or exercised during a phase carries an inline *Disposition (Mn)*
+note, for that phase's milestone, naming the implementation-plan slice that
+recorded the resolution. A decision can carry one note per phase that changed
+its answer. Items without one remain open.
 
 1. **Can an `AgentId` have concurrent active runs?** Recommended: yes, with
    independent run entities and idempotent/CAS private-memory writes.
@@ -2771,6 +2772,21 @@ without one remain open.
 6. **How are agent cards assigned?** Recommended: stable cards/skills identify
    an `AgentId` or agent template; every created task receives a distinct
    `AgentTaskId` and its initial assignee receives a distinct `AgentRunId`.
+   *Disposition (M5): accepted — application-owned catalogs carry the
+   recommended shape. `A2AAgentCatalog` resolves an A2A send's
+   `io.rakka.agent.id` and task-definition selection to one
+   `(AgentId, AgentTaskDefinition)` target and fails closed when nothing
+   matches (slice 1.12); `AgentDelegationCatalog` resolves a model-named skill
+   to the concrete agent (slice 4.3); a handoff resolves its target through
+   the same `AgentDelegationCatalog`, and the receiving A2A surface gates it
+   through `A2AAgentCatalog` (`resolve_handoff_target`, slice 5.1). Every
+   created task has its own `AgentTaskId`, which is the A2A `Task.id`
+   (decision 17), and each assignment generation's run has its own `AgentRunId`
+   (`run_id_for_assignment`, `{task}-gen-{generation}`, slice 1.4); a handoff
+   keeps the task, and its target runs under a new generation. The agent card
+   itself is the deployment's: `A2AAgentCardBuilder` projects one skill per
+   hosted workflow, and a deployment advertises its agents' skills itself — an
+   implementation call, recorded with issue #72.*
 7. **How long is short-term memory retained after a terminal run?**
    Recommended: tenant policy with bounded default, legal hold, export, and
    deletion support.
@@ -2879,6 +2895,14 @@ without one remain open.
 18. **Which coordination patterns become first-class?** Recommended: handoff,
     delegation, team, and moderation, each compiled into typed durable state
     with bounded policy rather than prompt-only conventions.
+    *Disposition (M5): accepted — each pattern is typed durable state with
+    bounded policy, admitted through the `AgentCoordinationCapabilityKind`
+    envelope dimension: delegation as `AgentDelegationCell` under
+    `AgentDelegationPolicy` (slice 4.3), handoff as `AgentHandoffRecord` and
+    `AgentHandoffCell` under `AgentHandoffPolicy` (slice 5.1), a team as the
+    `AgentTeamEntity` board under `AgentTeamPolicy` (slice 5.2), and moderation
+    as the `AgentConversationEntity` under `AgentModerationPolicy`
+    (slice 5.3). None is a prompt-only convention.*
 19. **How dynamic may run setup be?** Recommended: instructions and selected
     capabilities may vary within an authorized definition envelope; setup may
     never add undeclared tools/models/peers or weaken mandatory guardrails.
@@ -2894,6 +2918,17 @@ without one remain open.
 21. **Are coordination notifications replayable?** Recommended: yes, with
     bounded retention, monotonic scoped cursor, and explicit resync on an
     expired window; authoritative task/run state remains the correctness source.
+    *Disposition (M5): accepted — `rakka_agent::events` is a read contract over
+    the logs coordination already writes (slice 5.5): one scoped
+    `AgentCoordinationCursor`, `<entity address key>:<sequence>`, monotonic
+    within its scope, over the task, team and conversation history logs and
+    the run's decision-event sink; bounded pages
+    (`AGENT_COORDINATION_MAX_PAGE_SIZE`); and
+    `AgentCoordinationReplay::WindowExpired`, which names the retained floor
+    to resynchronize from. It adds no second write path, so durable task and
+    run state remain the correctness source. Slice 5.5b added the terminal
+    coordination notifications; scenario 45
+    (`crates/rakka-agent/tests/coordination_replay.rs`) holds the replay.*
 
 ## 22. Initial Acceptance Statement
 

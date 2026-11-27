@@ -566,9 +566,16 @@ fn feature_flags_are_additive_and_match_api_review_boundaries() {
         !CARGO_TOML.contains("\notel = "),
         "the inert `otel` feature must not be reintroduced; the OTLP bridge is unconditional"
     );
-    assert!(CARGO_TOML.contains("rakka-core = { path = \"../rakka-core\", version = \"0.1.0\" }"));
-    assert!(CARGO_TOML
-        .contains("rakka-workflow = { path = \"../rakka-workflow\", version = \"0.1.0\" }"));
+    // The internal requirements name the workspace's current version, which
+    // this crate carries too; the repository-hygiene suite holds every crate
+    // to the changelog's newest release.
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(CARGO_TOML.contains(&format!(
+        "rakka-core = {{ path = \"../rakka-core\", version = \"{version}\" }}"
+    )));
+    assert!(CARGO_TOML.contains(&format!(
+        "rakka-workflow = {{ path = \"../rakka-workflow\", version = \"{version}\" }}"
+    )));
 }
 
 #[test]

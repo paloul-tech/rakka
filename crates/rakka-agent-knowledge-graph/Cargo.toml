@@ -1,6 +1,6 @@
 [package]
 name = "rakka-agent-knowledge-graph"
-version = "0.1.0"
+version = "0.2.0"
 description.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,11 +20,11 @@ name = "rakka_agent_knowledge_graph"
 # The agent-domain identity, classification, digest, and checkpoint-grant
 # contracts the communal graph reuses. Default features are off: a claim store
 # never touches the model adapter, so the `rig` feature is not pulled in.
-rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
+rakka-agent = { path = "../rakka-agent", version = "0.2.0", default-features = false }
 # `PrincipalRef`, `ArtifactRef`, `AgentEffectId`, and `AgentTimestampMillis`
 # are durable-substrate types claims and transitions carry (already in the
 # tree through rakka-agent).
-rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.2.0" }
 # Claim records and their mirror structs serialize with serde; the canonical
 # promotion payload and inline claim objects are `serde_json` values.
 serde.workspace = true

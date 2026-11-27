@@ -1,6 +1,6 @@
 [package]
 name = "rakka-stream"
-version = "0.1.0"
+version = "0.2.0"
 description.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,15 +19,15 @@ adapters = ["dep:rakka-sharding"]
 process-io = ["dep:rakka-process"]
 
 [dependencies]
-rakka-core = { path = "../rakka-core", version = "0.1.0" }
-rakka-process = { path = "../rakka-process", version = "0.1.0", optional = true }
-rakka-sharding = { path = "../rakka-sharding", version = "0.1.0", optional = true }
+rakka-core = { path = "../rakka-core", version = "0.2.0" }
+rakka-process = { path = "../rakka-process", version = "0.2.0", optional = true }
+rakka-sharding = { path = "../rakka-sharding", version = "0.2.0", optional = true }
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
+rakka-cluster = { path = "../rakka-cluster", version = "0.2.0" }
 serde_json.workspace = true
 
 [lints]

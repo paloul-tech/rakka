@@ -34,6 +34,36 @@ fn read(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
 }
 
+/// The newest released version in `CHANGELOG.md`: the `## X.Y.Z (date)`
+/// heading right under `## Unreleased`.
+fn changelog_version() -> String {
+    let changelog = read("CHANGELOG.md");
+    let mut headings = changelog.lines().filter(|line| line.starts_with("## "));
+    assert_eq!(
+        headings.next(),
+        Some("## Unreleased"),
+        "CHANGELOG.md opens with `## Unreleased`"
+    );
+    let released = headings
+        .next()
+        .expect("CHANGELOG.md has a heading under `## Unreleased`");
+    released
+        .strip_prefix("## ")
+        .and_then(|rest| rest.split_once(" ("))
+        .map(|(version, _)| version)
+        .filter(|version| {
+            let parts: Vec<&str> = version.split('.').collect();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
+        .unwrap_or_else(|| {
+            panic!("the heading under `## Unreleased` is no released version: {released}")
+        })
+        .to_string()
+}
+
 fn section_between<'a>(contents: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = contents
         .find(start)
@@ -175,13 +205,14 @@ fn publishable_crates_have_release_metadata_and_versioned_internal_deps() {
             "crates/{crate_name}/LICENSE should resolve to the root license so the packaged crate carries it"
         );
 
+        let required = format!("version = \"{}\"", changelog_version());
         for line in manifest
             .lines()
             .filter(|line| line.contains("path = \"../rakka-"))
         {
             assert!(
-                line.contains("version = \"0.1.0\""),
-                "{manifest_path} has an internal path dependency without version: {line}"
+                line.contains(&required),
+                "{manifest_path} has an internal path dependency without the current version: {line}"
             );
         }
     }
@@ -548,4 +579,85 @@ fn examples_index_names_every_example_package() {
         checked > 0,
         "the example scan found nothing, so nothing is checked"
     );
+}
+
+/// Every decision in specification 21.3 carries a disposition, so none
+/// reads as open after the code answered it (issue #72).
+#[test]
+fn every_decision_in_the_register_carries_a_disposition() {
+    let spec = read("docs/plans/rakka-agent/spec.md");
+    let section = section_between(
+        &spec,
+        "### 21.3 Open Decisions",
+        "## 22. Initial Acceptance Statement",
+    );
+    let mut decisions: Vec<(u32, String)> = Vec::new();
+    for line in section.lines() {
+        let number = line
+            .split_once(". **")
+            .and_then(|(number, _)| number.parse::<u32>().ok());
+        match number {
+            Some(number) => decisions.push((number, line.to_string())),
+            None => {
+                if let Some((_, text)) = decisions.last_mut() {
+                    text.push('\n');
+                    text.push_str(line);
+                }
+            }
+        }
+    }
+    let numbers: Vec<u32> = decisions.iter().map(|(number, _)| *number).collect();
+    assert!(!numbers.is_empty(), "21.3 lists no decisions");
+    assert_eq!(
+        numbers,
+        (1..=numbers.len() as u32).collect::<Vec<_>>(),
+        "21.3 numbers its decisions consecutively from 1"
+    );
+    let open: Vec<u32> = decisions
+        .iter()
+        .filter(|(_, text)| !text.contains("*Disposition (M"))
+        .map(|(number, _)| *number)
+        .collect();
+    assert!(open.is_empty(), "decisions without a disposition: {open:?}");
+}
+
+/// Every crate carries the changelog's newest version, and every internal
+/// dependency requires it, so a version cut cannot leave one behind
+/// (issue #72).
+#[test]
+fn every_crate_carries_the_changelog_version() {
+    let version = changelog_version();
+    let package = format!("version = \"{version}\"");
+    let mut checked = 0;
+    for entry in fs::read_dir(repo_root().join("crates")).expect("crates/ is readable") {
+        let manifest = entry
+            .expect("a directory entry is readable")
+            .path()
+            .join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let contents = fs::read_to_string(&manifest).expect("the manifest is readable");
+        let declared = contents
+            .lines()
+            .skip_while(|line| *line != "[package]")
+            .find(|line| line.starts_with("version = "))
+            .unwrap_or_else(|| panic!("{} declares no package version", manifest.display()));
+        assert_eq!(declared, package, "{}", manifest.display());
+        // A requirement that names a version names this one. A path-only
+        // dev-dependency (`rakka-agent`'s on `rakka-agent-mcp`, which depends
+        // back on it) names none, so a cut cannot leave it behind.
+        for line in contents
+            .lines()
+            .filter(|line| line.contains("path = \"../rakka") && line.contains("version = "))
+        {
+            assert!(
+                line.contains(&package),
+                "{} requires another version of an internal crate: {line}",
+                manifest.display()
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no crate manifest was checked");
 }

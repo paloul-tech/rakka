@@ -73,11 +73,15 @@ fn facade_propagates_the_agent_features() {
     // The facade turns the crate's default `rig` feature off so that the
     // passthrough is a real knob: an application can take the agent runtime
     // without the Rig dependency.
+    // The requirement names the workspace's current version, which this crate
+    // carries too; the repository-hygiene suite holds every crate to the
+    // changelog's newest release.
     assert!(
-        facade.contains(
-            "rakka-agent = { path = \"../rakka-agent\", version = \"0.1.0\", optional = true, \
-             default-features = false }"
-        ),
+        facade.contains(&format!(
+            "rakka-agent = {{ path = \"../rakka-agent\", version = \"{}\", optional = true, \
+             default-features = false }}",
+            env!("CARGO_PKG_VERSION")
+        )),
         "the facade should depend on rakka-agent with default features disabled"
     );
 }
