@@ -65,7 +65,18 @@ The publishable crate set is:
 
 Examples are workspace packages for review and testing, but they must remain `publish = false`.
 
-Internal crate dependencies use both `path` and `version = "0.1.0"`. The local package script uses offline `--list` checks for crates that depend on other unpublished Rakka crates, then verifies `rakka-core` fully because it has no internal unpublished dependency.
+Internal crate dependencies use both `path` and `version`. The version is the newest release in `CHANGELOG.md`: every crate carries it and every internal requirement names it, which `crates/rakka-testkit/tests/repository_hygiene.rs` checks. The local package script uses offline `--list` checks for crates that depend on other unpublished Rakka crates, then verifies `rakka-core` fully because it has no internal unpublished dependency.
+
+## Cutting a Version
+
+A version is cut in one pull request and tagged after it merges. Before 1.0, each cut takes the next minor version, `0.Y.0`.
+
+1. On a branch, set every `crates/*/Cargo.toml` package version, and every internal `path` dependency's `version`, to the new version. The examples keep their own versions.
+2. In `CHANGELOG.md`, move everything under `## Unreleased` into a new `## 0.Y.0 (<date>)` section directly below it, and leave `## Unreleased` empty.
+3. Run `scripts/validate.sh` and `scripts/package-check.sh`. Both must pass; the repository-hygiene suite fails on a crate or requirement left at the old version.
+4. After the pull request merges, tag the merge commit: `git tag -a v0.Y.0 <merge commit> -m "Rakka 0.Y.0"`. Push the tag only on the owner's word.
+
+A tag publishes nothing to a registry; publishing stays under "No Publishing Without Explicit Approval" above.
 
 ## Release Profile Guidance
 

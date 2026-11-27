@@ -2022,7 +2022,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rakka"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-a2a",
  "rakka-agent",
@@ -2045,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-a2a"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum 0.8.9",
  "bytes",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-agent-knowledge-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "rakka-agent",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-agent-knowledge-graph-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-agent",
  "rakka-agent-knowledge-graph",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-agent-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum 0.8.9",
  "futures-util",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-agent-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-agent",
  "rakka-agent-workflow",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-agent-workflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-cluster",
  "rakka-core",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-cluster"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-core",
  "serde",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "serde",
@@ -2194,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-discovery-etcd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "etcd-client",
  "rakka-cluster",
@@ -2539,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-grpc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "prost 0.13.5",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum 0.8.9",
  "futures-util",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-k8s"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum 0.8.9",
  "rakka-cluster",
@@ -2588,7 +2588,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-persistence"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-core",
  "rakka-stream",
@@ -2598,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-persistence-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-core",
  "rakka-persistence",
@@ -2608,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-process"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-cluster",
  "rakka-core",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-remote"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost 0.13.5",
  "rakka-cluster",
@@ -2633,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-sharding"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost 0.13.5",
  "rakka-cluster",
@@ -2647,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-sharding-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-cluster",
  "rakka-core",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-stream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-cluster",
  "rakka-core",
@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum 0.8.9",
  "futures-util",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "rakka-workflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rakka-core",
  "rakka-persistence",

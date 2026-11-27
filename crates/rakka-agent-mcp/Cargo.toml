@@ -1,6 +1,6 @@
 [package]
 name = "rakka-agent-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -40,9 +40,9 @@ rmcp = { version = "=3.4.0", default-features = false, features = ["client", "tr
 # The tool contracts this adapter fills: descriptors, bindings, declarations,
 # the dispatch executor trait, refusals, identity validation. Default features
 # off: an MCP executor never touches the model adapter.
-rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
+rakka-agent = { path = "../rakka-agent", version = "0.2.0", default-features = false }
 # `AgentEphemeralCredential`, `ArtifactRef`, the artifact store, timestamps.
-rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.2.0" }
 # `HeaderName`/`HeaderValue`: the types rmcp's transport config names for a
 # custom header. rmcp does not re-export `http`, so the credential-to-header
 # step has to name the same crate rmcp links.

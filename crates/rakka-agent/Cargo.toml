@@ -1,6 +1,6 @@
 [package]
 name = "rakka-agent"
-version = "0.1.0"
+version = "0.2.0"
 description.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,11 +28,11 @@ otel = []
 
 [dependencies]
 futures-util.workspace = true
-rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
-rakka-core = { path = "../rakka-core", version = "0.1.0" }
-rakka-persistence = { path = "../rakka-persistence", version = "0.1.0" }
-rakka-remote = { path = "../rakka-remote", version = "0.1.0" }
-rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.2.0" }
+rakka-core = { path = "../rakka-core", version = "0.2.0" }
+rakka-persistence = { path = "../rakka-persistence", version = "0.2.0" }
+rakka-remote = { path = "../rakka-remote", version = "0.2.0" }
+rakka-sharding = { path = "../rakka-sharding", version = "0.2.0" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -52,10 +52,10 @@ rig-core = { version = "=0.37.0", default-features = false, features = ["rustls"
 # trigger path yields one identity (slice 3.1 exit criterion). Dev-only, so it
 # never enters the publishable dependency tree.
 proptest.workspace = true
-rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
+rakka-cluster = { path = "../rakka-cluster", version = "0.2.0" }
 # The gated PostgreSQL measurement of the effect flush's per-round workflow
 # loads (`effect_flush_postgres.rs`, issue #25). Dev-only.
-rakka-persistence-postgres = { path = "../rakka-persistence-postgres", version = "0.1.0" }
+rakka-persistence-postgres = { path = "../rakka-persistence-postgres", version = "0.2.0" }
 tokio-postgres.workspace = true
 # The in-process fake providers `rig_provider_fake_endpoint.rs` serves. The
 # HTTP backend it injects is rig's own re-exported client
