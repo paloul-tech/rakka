@@ -11,46 +11,53 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rakka_agent_workflow::{
     AgentCausationId, AgentCommandId, AgentCommandMetadata, AgentCompiledExecutionPlan,
-    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
     AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
     AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId, AgentDeduplicationKey,
     AgentDurabilityMetadata, AgentEffectId, AgentEffectTarget, AgentGraphEffectBridge,
     AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleRequest,
     AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerTransition,
-    AgentOutboxSettlement, AgentRunId, AgentRunInbox, AgentTenantId, AgentTimestampMillis,
-    AgentWorkflowId, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    HumanDecisionOption, WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
-    DISPATCH_CANCELLED_IN_FLIGHT_LINE,
+    AgentGraphTerminalStatus, AgentOutboxSettlement, AgentRunActor, AgentRunActorCommand,
+    AgentRunCore, AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunRuntimeError,
+    AgentRunState, AgentRunStatus, AgentRunTransitionKind, AgentSettledOutboxEntry,
+    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentTenantId,
+    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, HumanDecisionOption, StateSchemaVersion, WorkflowDefinitionVersion,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, DISPATCH_CANCELLED_IN_FLIGHT_LINE,
 };
+use rakka_core::{ActorRef, ActorSystem};
 use rakka_persistence::{
-    DurableError, DurableStateStore, InMemoryDurableStateStore, PersistenceId, Revision,
-    StateRecord, StoreFuture,
+    DurableError, DurableState, DurableStateStore, InMemoryDurableStateStore, PersistenceId,
+    Revision, StateRecord, StoreFuture,
 };
 use rakka_workflow::{
     ManualWorkflowClock, OutboxDispatchFuture, OutboxDispatchResult, OutboxDispatcher, OutboxEntry,
     OutboxMessageId, OutboxStatus, WorkflowState, WorkflowTimestamp,
 };
 
-type TestStore = InMemoryDurableStateStore<WorkflowState>;
+type FaultyWorkflowStore = FaultyStore<WorkflowState>;
+type FaultyRunStore = FaultyStore<AgentRunState>;
 type TestInbox = AgentRunInbox<FaultyWorkflowStore, ManualWorkflowClock>;
+type TestCore = AgentRunCore<FaultyRunStore, FaultyWorkflowStore, ManualWorkflowClock>;
 
-/// A workflow store whose `n`th compare-and-set from arming fails once, as a
-/// store error. Unarmed, it is the in-memory store.
+/// A store whose `n`th compare-and-set from arming fails once, as a store
+/// error. Unarmed, it is the in-memory store.
 #[derive(Clone)]
-struct FaultyWorkflowStore {
-    inner: TestStore,
+struct FaultyStore<S: DurableState> {
+    inner: InMemoryDurableStateStore<S>,
     /// The compare-and-set count, from arming, that fails; 0 is unarmed.
     fail_at: Arc<AtomicUsize>,
     seen: Arc<AtomicUsize>,
 }
 
-impl FaultyWorkflowStore {
+impl<S: DurableState> FaultyStore<S> {
     fn new() -> Self {
         Self {
-            inner: TestStore::new(),
+            inner: InMemoryDurableStateStore::new(),
             fail_at: Arc::new(AtomicUsize::new(0)),
             seen: Arc::new(AtomicUsize::new(0)),
         }
@@ -63,7 +70,7 @@ impl FaultyWorkflowStore {
     }
 }
 
-impl DurableStateStore<WorkflowState> for FaultyWorkflowStore {
+impl<S: DurableState> DurableStateStore<S> for FaultyStore<S> {
     fn backend_name(&self) -> &'static str {
         "faulty-memory"
     }
@@ -71,7 +78,7 @@ impl DurableStateStore<WorkflowState> for FaultyWorkflowStore {
     fn load<'a>(
         &'a self,
         persistence_id: &'a PersistenceId,
-    ) -> StoreFuture<'a, Option<StateRecord<WorkflowState>>> {
+    ) -> StoreFuture<'a, Option<StateRecord<S>>> {
         self.inner.load(persistence_id)
     }
 
@@ -79,8 +86,8 @@ impl DurableStateStore<WorkflowState> for FaultyWorkflowStore {
         &'a self,
         persistence_id: &'a PersistenceId,
         expected_revision: Revision,
-        state: WorkflowState,
-    ) -> StoreFuture<'a, StateRecord<WorkflowState>> {
+        state: S,
+    ) -> StoreFuture<'a, StateRecord<S>> {
         let fail_at = self.fail_at.load(Ordering::SeqCst);
         if fail_at > 0 && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == fail_at {
             self.fail_at.store(0, Ordering::SeqCst);
@@ -249,7 +256,7 @@ async fn a_terminal_or_absent_entry_is_left_alone() {
     transition
         .state
         .node_states
-        .get_mut(&rakka_agent_workflow::AgentCompiledNodeId::new("effect"))
+        .get_mut(&node("effect"))
         .expect("the node state")
         .scheduled_effect_ids
         .push(AgentEffectId::new("effect-compacted-away"));
@@ -305,7 +312,7 @@ async fn only_the_nodes_the_transition_cancelled_are_settled() {
             .transition
             .state
             .node_states
-            .get(&rakka_agent_workflow::AgentCompiledNodeId::new("effect"))
+            .get(&node("effect"))
             .expect("the node state")
             .status,
         AgentGraphNodeStatus::Completed
@@ -399,15 +406,328 @@ async fn a_settle_that_fails_part_way_converges() {
 }
 
 // ---------------------------------------------------------------------------
+// The run's cancel, through the core (issue #71 item 4, design 5.3).
+// ---------------------------------------------------------------------------
+
+/// The gap the issue names: a cancelled graph run's queued effect was still
+/// sent by the next dispatch pass (on the code before this change, the
+/// dispatcher counted 1). The cancel now cancels the graph, settles the
+/// cancelled nodes' entries, and ends the run in one recorded `Cancel`.
+#[tokio::test]
+async fn a_cancelled_graph_run_sends_none_of_its_queued_effects() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel");
+    let (mut core, effect_id) = core_with_effect_scheduled(&fixture, &run_id).await;
+    request_cancellation(&mut core).await;
+
+    let cancellation = core.cancel(ts(500)).await.expect("the run cancels");
+
+    assert_eq!(cancellation.transition.kind, AgentRunTransitionKind::Cancel);
+    assert_eq!(
+        cancellation.transition.previous_status,
+        Some(AgentRunStatus::Cancelling)
+    );
+    assert_eq!(
+        cancellation.transition.next_status,
+        AgentRunStatus::Cancelled
+    );
+    let state = &cancellation.transition.state;
+    assert_eq!(state.current_step_id, None);
+    assert_eq!(state.completed_at, Some(ts(500)));
+    let graph = state.graph_state.as_ref().expect("the run has its graph");
+    assert_eq!(
+        graph.terminal_status,
+        Some(AgentGraphTerminalStatus::Cancelled)
+    );
+    assert_eq!(
+        cancellation.cancelled_node_ids,
+        vec![node("effect"), node("terminal")]
+    );
+    assert_eq!(
+        settled_pairs(&cancellation.settled_entries),
+        vec![(effect_id.clone(), AgentOutboxSettlement::Cancelled)]
+    );
+
+    let mut dispatcher = CountingDispatcher::default();
+    let parts = core.parts_mut();
+    parts
+        .inbox
+        .inner_mut()
+        .dispatch_due_outbox(&mut dispatcher)
+        .await
+        .expect("the dispatch pass runs");
+    assert_eq!(
+        dispatcher.dispatched, 0,
+        "a cancelled run's effect is not sent"
+    );
+    assert_eq!(
+        entry(parts.inbox, &effect_id).status(),
+        OutboxStatus::Cancelled
+    );
+}
+
+/// A node waiting on a human checkpoint has its approval request settled by
+/// the cancel too, beside its sibling's effect.
+#[tokio::test]
+async fn cancel_settles_a_checkpoints_approval_request() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-checkpoint");
+    let plan = effect_and_review_plan();
+    let mut core = core_with_started(&fixture, &run_id, &plan, &["effect", "review"]).await;
+    let effect_id = core
+        .schedule_graph_node_effect(&plan, effect_request(run_id.clone(), "effect", 160))
+        .await
+        .expect("the effect schedules")
+        .effect_outcome
+        .effect
+        .effect_id;
+    let parts = core.parts_mut();
+    let opened = parts
+        .graph_runtime
+        .effect_bridge()
+        .open_node_human_checkpoint(
+            &plan,
+            graph_of(parts.runner),
+            human_checkpoint_request(
+                run_id.clone(),
+                "review",
+                checkpoint("checkpoint-review"),
+                170,
+            ),
+            &mut *parts.inbox,
+        )
+        .await
+        .expect("the checkpoint opens");
+    parts
+        .runner
+        .update_graph_state(opened.transition.state, ts(170))
+        .await
+        .expect("the checkpoint's wait persists");
+    let approval_id = opened.approval_effect.effect_id;
+    request_cancellation(&mut core).await;
+
+    let cancellation = core.cancel(ts(500)).await.expect("the run cancels");
+
+    assert_eq!(
+        cancellation.cancelled_node_ids,
+        vec![node("effect"), node("review"), node("terminal")]
+    );
+    assert_eq!(
+        settled_pairs(&cancellation.settled_entries),
+        vec![
+            (effect_id.clone(), AgentOutboxSettlement::Cancelled),
+            (approval_id.clone(), AgentOutboxSettlement::Cancelled),
+        ]
+    );
+    let inbox = core.parts_mut().inbox;
+    assert_eq!(entry(inbox, &effect_id).status(), OutboxStatus::Cancelled);
+    assert_eq!(entry(inbox, &approval_id).status(), OutboxStatus::Cancelled);
+}
+
+/// The entries are settled before the run's write: a crash between them
+/// leaves the entries settled and the run still cancelling, and a repeat
+/// finishes the run and settles nothing more.
+#[tokio::test]
+async fn a_crash_between_the_settle_and_the_run_write_converges() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-crash");
+    let (mut core, effect_id) = core_with_effect_scheduled(&fixture, &run_id).await;
+    request_cancellation(&mut core).await;
+
+    fixture.run_store.fail_write(1);
+    let failed = core.cancel(ts(500)).await;
+    assert!(
+        matches!(
+            &failed,
+            Err(AgentRunRuntimeError::RunEngine {
+                error: AgentRunEngineError::Persistence { .. }
+            })
+        ),
+        "the run's write failed: {failed:?}"
+    );
+    assert_eq!(
+        entry(core.parts_mut().inbox, &effect_id).status(),
+        OutboxStatus::Cancelled,
+        "the entry was settled before the run's write"
+    );
+    assert_eq!(run_status(&mut core), AgentRunStatus::Cancelling);
+
+    let cancellation = core.cancel(ts(510)).await.expect("the repeat finishes");
+    assert_eq!(
+        cancellation.transition.next_status,
+        AgentRunStatus::Cancelled
+    );
+    assert_eq!(
+        cancellation.cancelled_node_ids,
+        vec![node("effect"), node("terminal")]
+    );
+    assert!(
+        cancellation.settled_entries.is_empty(),
+        "the repeat reports only what it wrote: {:?}",
+        cancellation.settled_entries
+    );
+}
+
+/// A run with no graph cancels as it did: the same transition, and nothing
+/// cancelled or settled.
+#[tokio::test]
+async fn a_run_without_a_graph_cancels_as_before() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-steps");
+    let mut core = fixture.core(&run_id);
+    core.recover().await.expect("the core recovers");
+    core.start(accepted_run_state(&run_id, Some(AgentStepId::new("plan"))))
+        .await
+        .expect("the run starts");
+    request_cancellation(&mut core).await;
+
+    let cancellation = core.cancel(ts(500)).await.expect("the run cancels");
+
+    assert_eq!(cancellation.transition.kind, AgentRunTransitionKind::Cancel);
+    assert_eq!(
+        cancellation.transition.next_status,
+        AgentRunStatus::Cancelled
+    );
+    assert_eq!(cancellation.transition.state.graph_state, None);
+    // The runner's own cancel, which leaves the step as it was.
+    assert_eq!(
+        cancellation.transition.state.current_step_id,
+        Some(AgentStepId::new("plan"))
+    );
+    assert!(cancellation.cancelled_node_ids.is_empty());
+    assert!(cancellation.settled_entries.is_empty());
+}
+
+/// A cancel on a run already cancelled is refused, as it was.
+#[tokio::test]
+async fn cancel_on_a_cancelled_run_is_refused() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-twice");
+    let (mut core, _effect_id) = core_with_effect_scheduled(&fixture, &run_id).await;
+    request_cancellation(&mut core).await;
+    core.cancel(ts(500)).await.expect("the run cancels");
+
+    let refused = core
+        .cancel(ts(510))
+        .await
+        .expect_err("a cancelled run cannot cancel again");
+    assert!(
+        matches!(
+            &refused,
+            AgentRunRuntimeError::RunEngine {
+                error: AgentRunEngineError::InvalidTransition { .. }
+            }
+        ),
+        "{refused:?}"
+    );
+}
+
+/// The host's own sequence still works as it did: the plan's cancel
+/// persisted through `update_graph_state` ends the run cancelled. That write
+/// is composed by the owner, so it settles nothing on its own (design 5.3a),
+/// and a `Cancel` afterwards is refused.
+#[tokio::test]
+async fn the_hosts_own_cancel_sequence_still_works() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-host");
+    let plan = effect_plan();
+    let (mut core, effect_id) = core_with_effect_scheduled(&fixture, &run_id).await;
+    request_cancellation(&mut core).await;
+
+    let parts = core.parts_mut();
+    let transition = parts
+        .graph_runtime
+        .scheduler()
+        .cancel_graph_run(&plan, graph_of(parts.runner), ts(450))
+        .expect("the graph cancels");
+    parts
+        .runner
+        .update_graph_state(transition.state, ts(450))
+        .await
+        .expect("the cancelled graph persists");
+
+    assert_eq!(run_status(&mut core), AgentRunStatus::Cancelled);
+    assert_eq!(
+        entry(core.parts_mut().inbox, &effect_id).status(),
+        OutboxStatus::Pending,
+        "an owner-composed write settles nothing on its own"
+    );
+    core.cancel(ts(500))
+        .await
+        .expect_err("the run is already cancelled");
+}
+
+/// The runner's cancel-with-graph write takes only a cancelled graph, so a
+/// run never ends cancelled over a graph still running.
+#[tokio::test]
+async fn the_runner_cancels_with_a_graph_only_when_it_is_cancelled() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-running-graph");
+    let (mut core, _effect_id) = core_with_effect_scheduled(&fixture, &run_id).await;
+    request_cancellation(&mut core).await;
+
+    let parts = core.parts_mut();
+    let running = graph_of(parts.runner);
+    let refused = parts
+        .runner
+        .cancel_with_graph_state(running, ts(500))
+        .await
+        .expect_err("a graph still running is refused");
+    assert!(
+        matches!(refused, AgentRunEngineError::InvalidRunState { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(run_status(&mut core), AgentRunStatus::Cancelling);
+}
+
+/// The actor's `Cancel` answers what the core's cancel answers, for the same
+/// stores and inputs.
+#[tokio::test]
+async fn the_actor_answers_cancel_as_the_core_does() {
+    let run_id = AgentRunId::new("run-core-cancel-actor");
+    let through_core = CoreFixture::new();
+    let (mut core, _effect_id) = core_with_effect_scheduled(&through_core, &run_id).await;
+    request_cancellation(&mut core).await;
+    let from_core = core.cancel(ts(500)).await;
+
+    let through_actor = CoreFixture::new();
+    let (mut prepared, _effect_id) = core_with_effect_scheduled(&through_actor, &run_id).await;
+    request_cancellation(&mut prepared).await;
+    drop(prepared);
+    let system = ActorSystem::new("graph-cancellation-actor");
+    let actor: ActorRef<AgentRunActorCommand> = system
+        .spawn("run", AgentRunActor::from_core(through_actor.core(&run_id)))
+        .expect("the actor spawns");
+    let from_actor = actor
+        .ask(
+            |reply_to| AgentRunActorCommand::Cancel {
+                now: ts(500),
+                reply_to,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the actor replies");
+
+    assert!(from_core.is_ok(), "{from_core:?}");
+    assert_eq!(from_actor, from_core);
+    system.terminate().await.expect("the system terminates");
+}
+
+// ---------------------------------------------------------------------------
 // Fixtures.
 // ---------------------------------------------------------------------------
+
+fn node(id: &str) -> AgentCompiledNodeId {
+    AgentCompiledNodeId::new(id)
+}
 
 fn ts(millis: u64) -> AgentTimestampMillis {
     AgentTimestampMillis::new(millis)
 }
 
 async fn recovered_inbox(run_id: &str) -> (TestInbox, FaultyWorkflowStore) {
-    let store = FaultyWorkflowStore::new();
+    let store = FaultyStore::new();
     let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
     let mut inbox = AgentRunInbox::with_clock(AgentRunId::new(run_id), store.clone(), clock);
     inbox.recover().await.expect("the inbox recovers");
@@ -488,7 +808,14 @@ fn effect_plan() -> AgentCompiledExecutionPlan {
 
 /// `input` → `effect` (a human checkpoint) → `terminal`.
 fn checkpoint_plan() -> AgentCompiledExecutionPlan {
-    let checkpoint = AgentCompiledPlanNode::new("effect", AgentCompiledNodeKind::HumanCheckpoint)
+    single_node_plan(
+        "plan-cancel-checkpoint",
+        checkpoint_node("effect", "effect-result"),
+    )
+}
+
+fn checkpoint_node(id: &str, output: &str) -> AgentCompiledPlanNode {
+    AgentCompiledPlanNode::new(id, AgentCompiledNodeKind::HumanCheckpoint)
         .input_port(AgentCompiledPlanPort::new(
             "payload",
             AgentCompiledPortDirection::Input,
@@ -497,9 +824,8 @@ fn checkpoint_plan() -> AgentCompiledExecutionPlan {
         .output_port(AgentCompiledPlanPort::new(
             "result",
             AgentCompiledPortDirection::Output,
-            "effect-result",
-        ));
-    single_node_plan("plan-cancel-checkpoint", checkpoint)
+            output,
+        ))
 }
 
 fn single_node_plan(id: &str, middle: AgentCompiledPlanNode) -> AgentCompiledExecutionPlan {
@@ -529,51 +855,77 @@ fn single_node_plan(id: &str, middle: AgentCompiledPlanNode) -> AgentCompiledExe
         ))
 }
 
-/// `input` → `effect-a` and `effect-b` → `terminal`.
+/// `input` → `effect-a` and `effect-b` (tool calls) → `terminal`.
 fn two_effect_plan() -> AgentCompiledExecutionPlan {
+    two_branch_plan(
+        "plan-cancel-two-effects",
+        tool_node("effect-a", "effect-a-result"),
+        tool_node("effect-b", "effect-b-result"),
+    )
+}
+
+/// `input` → `effect` (a tool call) and `review` (a human checkpoint) →
+/// `terminal`.
+fn effect_and_review_plan() -> AgentCompiledExecutionPlan {
+    two_branch_plan(
+        "plan-cancel-effect-and-review",
+        tool_node("effect", "effect-result"),
+        checkpoint_node("review", "review-result"),
+    )
+}
+
+/// `input` → `left` and `right` → `terminal`, which needs both. Each branch
+/// node's output port is `result`, typed `<id>-result`.
+fn two_branch_plan(
+    id: &str,
+    left: AgentCompiledPlanNode,
+    right: AgentCompiledPlanNode,
+) -> AgentCompiledExecutionPlan {
+    let left_id = left.node_id.as_str().to_string();
+    let right_id = right.node_id.as_str().to_string();
     let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
         .input_port(AgentCompiledPlanPort::new(
-            "a",
+            "left",
             AgentCompiledPortDirection::Input,
-            "effect-a-result",
+            format!("{left_id}-result"),
         ))
         .input_port(AgentCompiledPlanPort::new(
-            "b",
+            "right",
             AgentCompiledPortDirection::Input,
-            "effect-b-result",
+            format!("{right_id}-result"),
         ));
-    plan_shell("plan-cancel-two-effects")
+    plan_shell(id)
         .node(input_node())
-        .node(tool_node("effect-a", "effect-a-result"))
-        .node(tool_node("effect-b", "effect-b-result"))
+        .node(left)
+        .node(right)
         .node(terminal)
         .edge(AgentCompiledPlanEdge::new(
-            "edge-input-a",
+            format!("edge-input-{left_id}"),
             "input",
             "payload",
-            "effect-a",
+            left_id.clone(),
             "payload",
         ))
         .edge(AgentCompiledPlanEdge::new(
-            "edge-input-b",
+            format!("edge-input-{right_id}"),
             "input",
             "payload",
-            "effect-b",
+            right_id.clone(),
             "payload",
         ))
         .edge(AgentCompiledPlanEdge::new(
-            "edge-a-terminal",
-            "effect-a",
+            format!("edge-{left_id}-terminal"),
+            left_id,
             "result",
             "terminal",
-            "a",
+            "left",
         ))
         .edge(AgentCompiledPlanEdge::new(
-            "edge-b-terminal",
-            "effect-b",
+            format!("edge-{right_id}-terminal"),
+            right_id,
             "result",
             "terminal",
-            "b",
+            "right",
         ))
 }
 
@@ -707,4 +1059,164 @@ fn command_metadata(
         ts(received_at_millis),
     )
     .expect("the command metadata validates")
+}
+
+/// The stores a core runs over, shared by every core a test builds.
+struct CoreFixture {
+    run_store: FaultyRunStore,
+    workflow_store: FaultyWorkflowStore,
+    clock: ManualWorkflowClock,
+}
+
+impl CoreFixture {
+    fn new() -> Self {
+        Self {
+            run_store: FaultyStore::new(),
+            workflow_store: FaultyStore::new(),
+            clock: ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100)),
+        }
+    }
+
+    fn core(&self, run_id: &AgentRunId) -> TestCore {
+        AgentRunCore::with_clock(
+            workflow(),
+            run_id.clone(),
+            self.run_store.clone(),
+            self.workflow_store.clone(),
+            self.clock.clone(),
+        )
+    }
+}
+
+/// The workflow every plan shell belongs to, with one step for a run that
+/// has no graph.
+fn workflow() -> AgentWorkflow {
+    AgentWorkflow {
+        workflow_id: AgentWorkflowId::new("workflow-graph-cancellation"),
+        workflow_type: "graph-cancellation".to_string(),
+        definition_version: WorkflowDefinitionVersion::new("v1"),
+        state_schema_version: StateSchemaVersion::new(1),
+        display_name: None,
+        status_labels: Vec::new(),
+        command_types: Vec::new(),
+        steps: vec![AgentStep {
+            step_id: AgentStepId::new("plan"),
+            kind: AgentStepKind::Planner,
+            display_name: None,
+            next_step_ids: Vec::new(),
+            timeout_ms: Some(1_000),
+            config_ref: None,
+            observability_labels: BTreeMap::new(),
+        }],
+        payload_types: Vec::new(),
+        retry_policy_ref: None,
+        timeout_policy_ref: None,
+        approval_policy_ref: None,
+        observability_labels: BTreeMap::new(),
+    }
+}
+
+/// An accepted run, on `first_step_id` when it has no graph.
+fn accepted_run_state(run_id: &AgentRunId, first_step_id: Option<AgentStepId>) -> AgentRunState {
+    let workflow = workflow();
+    AgentRunState {
+        run_id: run_id.clone(),
+        workflow_id: workflow.workflow_id,
+        tenant: Some(AgentTenantId::new("tenant-a")),
+        definition_version: workflow.definition_version,
+        state_schema_version: workflow.state_schema_version,
+        graph_state: None,
+        status: AgentRunStatus::Accepted,
+        current_step_id: first_step_id,
+        current_attempt: 0,
+        inputs_ref: None,
+        state_payload: AgentStatePayload::Empty,
+        checkpoints: Vec::new(),
+        pending_effects: Vec::new(),
+        pending_human_checkpoint: None,
+        cancellation: None,
+        created_at: ts(100),
+        updated_at: ts(100),
+        completed_at: None,
+    }
+}
+
+/// A recovered core over `plan`, its `input` completed and `nodes` started.
+async fn core_with_started(
+    fixture: &CoreFixture,
+    run_id: &AgentRunId,
+    plan: &AgentCompiledExecutionPlan,
+    nodes: &[&str],
+) -> TestCore {
+    let mut core = fixture.core(run_id);
+    core.recover().await.expect("the core recovers");
+    core.start_graph(accepted_run_state(run_id, None), plan, ts(100))
+        .await
+        .expect("the graph starts");
+    core.mark_graph_ready(plan, ts(110))
+        .await
+        .expect("input is ready");
+    core.start_graph_node(plan, node("input"), ts(120))
+        .await
+        .expect("input starts");
+    core.complete_graph_node(plan, node("input"), ts(130))
+        .await
+        .expect("input completes");
+    core.mark_graph_ready(plan, ts(140))
+        .await
+        .expect("the next nodes are ready");
+    for (offset, name) in (0u64..).zip(nodes) {
+        core.start_graph_node(plan, node(name), ts(150 + offset))
+            .await
+            .expect("the node starts");
+    }
+    core
+}
+
+/// A recovered core on [`effect_plan`] with `effect`'s effect scheduled.
+async fn core_with_effect_scheduled(
+    fixture: &CoreFixture,
+    run_id: &AgentRunId,
+) -> (TestCore, AgentEffectId) {
+    let plan = effect_plan();
+    let mut core = core_with_started(fixture, run_id, &plan, &["effect"]).await;
+    let scheduled = core
+        .schedule_graph_node_effect(&plan, effect_request(run_id.clone(), "effect", 160))
+        .await
+        .expect("the effect schedules");
+    let effect_id = scheduled.effect_outcome.effect.effect_id.clone();
+    (core, effect_id)
+}
+
+async fn request_cancellation(core: &mut TestCore) {
+    core.request_cancellation("operator-cancel".to_string(), None, ts(400))
+        .await
+        .expect("cancellation is requested");
+}
+
+fn settled_pairs(
+    settled: &[AgentSettledOutboxEntry],
+) -> Vec<(AgentEffectId, AgentOutboxSettlement)> {
+    settled
+        .iter()
+        .map(|entry| (entry.effect_id.clone(), entry.settlement))
+        .collect()
+}
+
+/// The graph state the runner holds.
+fn graph_of(runner: &AgentStepRunner<FaultyRunStore>) -> AgentGraphRunState {
+    runner
+        .state()
+        .expect("the runner reads")
+        .and_then(|state| state.graph_state.clone())
+        .expect("the run has graph state")
+}
+
+fn run_status(core: &mut TestCore) -> AgentRunStatus {
+    core.parts_mut()
+        .runner
+        .state()
+        .expect("the runner reads")
+        .expect("the run exists")
+        .status
 }

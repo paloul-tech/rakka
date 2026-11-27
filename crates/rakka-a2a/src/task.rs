@@ -546,6 +546,7 @@ pub fn task_event_from_runtime_event(
         | AgentRuntimeEventKind::NodeStarted
         | AgentRuntimeEventKind::NodeCompleted
         | AgentRuntimeEventKind::NodeSkipped
+        | AgentRuntimeEventKind::NodeCancelled
         | AgentRuntimeEventKind::NodeFailed
         | AgentRuntimeEventKind::EffectScheduled
         | AgentRuntimeEventKind::EffectCompleted

@@ -800,6 +800,7 @@ async fn apply_cancellation(
                 }
             })
             .await
+            .map(|cancellation| cancellation.transition)
         } else {
             ask_child(child, ask_timeout, |reply_to| {
                 AgentRunActorCommand::RequestCancellation {

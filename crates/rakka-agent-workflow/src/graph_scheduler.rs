@@ -590,13 +590,49 @@ impl AgentGraphScheduler {
     }
 
     /// Cancels a non-terminal graph run and all unresolved graph work.
+    ///
+    /// It checks the state against `plan`, then answers what
+    /// [`Self::cancel_graph_state`] answers.
     pub fn cancel_graph_run(
         &self,
         plan: &AgentCompiledExecutionPlan,
-        mut state: AgentGraphRunState,
+        state: AgentGraphRunState,
         now: AgentTimestampMillis,
     ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
         validate_plan_state(plan, &state)?;
+        self.cancel_graph_state(state, now)
+    }
+
+    /// Cancels a non-terminal graph run and all unresolved graph work, from
+    /// its durable state alone (issue #71 item 4).
+    ///
+    /// Cancelling needs no plan: it resolves every unresolved node and loop
+    /// instance the state holds, and the transition's changed nodes are the
+    /// ones it cancelled. The run core's cancel uses it, so a cancel's sender
+    /// supplies no plan.
+    ///
+    /// - A state from a newer graph schema is refused with
+    ///   [`AgentGraphSchedulerError::UnsupportedSchemaVersion`].
+    /// - A graph already `Cancelled` is answered unchanged, with no changed
+    ///   nodes.
+    /// - A graph that ended another way is refused with
+    ///   [`AgentGraphSchedulerError::TerminalGraph`].
+    ///
+    /// The transition is not persisted. Settle the cancelled nodes' outbox
+    /// entries
+    /// ([`AgentGraphEffectBridge::settle_cancelled_nodes`](crate::AgentGraphEffectBridge::settle_cancelled_nodes))
+    /// before persisting it.
+    pub fn cancel_graph_state(
+        &self,
+        mut state: AgentGraphRunState,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        if state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
+            return Err(AgentGraphSchedulerError::UnsupportedSchemaVersion {
+                found: state.graph_schema_version,
+                supported: CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+            });
+        }
         if let Some(status) = state.terminal_status {
             if status == AgentGraphTerminalStatus::Cancelled {
                 return Ok(AgentGraphSchedulerTransition::new(state, Vec::new()));

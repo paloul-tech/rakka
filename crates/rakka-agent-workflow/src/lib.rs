@@ -277,7 +277,7 @@ pub use retention::{
     AgentRetentionArchiveKind, AgentRetentionArchiveReason, AgentRetentionArchiveRecord,
     AgentRetentionCompactionReport, AgentRetentionPolicy, AgentRunStateCompaction,
 };
-pub use run_core::{AgentRunCore, AgentRunParts};
+pub use run_core::{AgentRunCancellation, AgentRunCore, AgentRunParts};
 pub use runner::{
     agent_run_persistence_id, AgentRunEngineError, AgentRunEngineResult, AgentRunTransition,
     AgentRunTransitionKind, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,

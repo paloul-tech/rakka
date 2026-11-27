@@ -37,9 +37,9 @@ use crate::{
     AgentGraphEffectScheduleRequest, AgentGraphRunProjection, AgentGraphRunState,
     AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphSchedulerTransition,
     AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError,
-    AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunState, AgentRunTransition,
-    AgentRunWaitReason, AgentStepRunner, AgentStepSuccess, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowSnapshotRegistry,
+    AgentRunCancellation, AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunState,
+    AgentRunTransition, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
+    AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
 };
 
 /// Shared result type for actor-backed agent run runtime operations.
@@ -557,12 +557,15 @@ pub enum AgentRunActorCommand {
         /// Reply channel for the persisted transition.
         reply_to: ReplyTo<AgentRunRuntimeResult<AgentRunTransition>>,
     },
-    /// Mark a cancelling run cancelled.
+    /// Mark a cancelling run cancelled: a run with a graph is cancelled
+    /// whole, its nodes and their outbox entries with it
+    /// ([`AgentRunCore::cancel`](crate::AgentRunCore::cancel)).
     Cancel {
         /// Transition timestamp.
         now: AgentTimestampMillis,
-        /// Reply channel for the persisted transition.
-        reply_to: ReplyTo<AgentRunRuntimeResult<AgentRunTransition>>,
+        /// Reply channel for the cancellation: the persisted transition, the
+        /// nodes it cancelled and the outbox entries it settled.
+        reply_to: ReplyTo<AgentRunRuntimeResult<AgentRunCancellation>>,
     },
     /// Move a failed run into compensation.
     BeginCompensation {

@@ -860,6 +860,57 @@ where
         .await
     }
 
+    /// Marks a cancelling run cancelled together with its cancelled graph, in
+    /// one write recorded as [`AgentRunTransitionKind::Cancel`] (issue #71
+    /// item 4).
+    ///
+    /// The run core's cancel computes the graph's cancel
+    /// ([`AgentGraphScheduler::cancel_graph_state`](crate::AgentGraphScheduler::cancel_graph_state)),
+    /// settles the cancelled nodes' outbox entries, then calls this. The run
+    /// leaves its step (`current_step_id` is cleared) and records when it
+    /// ended, as a graph that ends through [`Self::update_graph_state`] does.
+    ///
+    /// # Errors
+    ///
+    /// A graph state from a newer schema, one that is not `Cancelled`, or a
+    /// run that is not `Cancelling`.
+    pub async fn cancel_with_graph_state(
+        &mut self,
+        graph_state: AgentGraphRunState,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEngineResult<AgentRunTransition> {
+        let record = self.current_record()?;
+        self.check_graph_schema(&graph_state)?;
+        if graph_state.terminal_status != Some(AgentGraphTerminalStatus::Cancelled) {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "a run cancels with its graph only when the graph is cancelled",
+            });
+        }
+        let previous_status = record.state.status;
+        self.require_status(
+            previous_status,
+            &[AgentRunStatus::Cancelling],
+            AgentRunTransitionKind::Cancel,
+            "cancel can only complete from cancelling",
+        )?;
+
+        let mut next = record.state;
+        next.graph_state = Some(graph_state);
+        next.status = AgentRunStatus::Cancelled;
+        next.current_step_id = None;
+        next.updated_at = now;
+        next.completed_at = Some(now);
+
+        self.persist_transition(
+            AgentRunTransitionKind::Cancel,
+            Some(previous_status),
+            record.revision,
+            next,
+        )
+        .await
+    }
+
     /// Moves a failed run into compensation.
     pub async fn begin_compensation(
         &mut self,
@@ -895,14 +946,7 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunEngineResult<AgentRunTransition> {
         let record = self.current_record()?;
-        if graph_state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
-            return Err(AgentRunEngineError::WorkflowMismatch {
-                run_id: self.run_id.clone(),
-                field: "graph_schema_version",
-                expected: format!("<= {}", CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get()),
-                actual: graph_state.graph_schema_version.get().to_string(),
-            });
-        }
+        self.check_graph_schema(&graph_state)?;
         let previous_status = record.state.status;
         if graph_state.terminal_status.is_none() {
             self.reject_terminal(
@@ -1079,6 +1123,19 @@ where
         } else {
             Ok(())
         }
+    }
+
+    /// Refuses a graph state from a schema newer than this build reads.
+    fn check_graph_schema(&self, graph_state: &AgentGraphRunState) -> AgentRunEngineResult<()> {
+        if graph_state.graph_schema_version > CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION {
+            return Err(AgentRunEngineError::WorkflowMismatch {
+                run_id: self.run_id.clone(),
+                field: "graph_schema_version",
+                expected: format!("<= {}", CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get()),
+                actual: graph_state.graph_schema_version.get().to_string(),
+            });
+        }
+        Ok(())
     }
 
     async fn persist_transition(
