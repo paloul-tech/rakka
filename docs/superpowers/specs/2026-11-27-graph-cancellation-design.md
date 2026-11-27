@@ -369,3 +369,101 @@ fail:
   workflow tests already use.
 - Where `NodeCancelled` sits in the label table and in the docs that list
   the kinds.
+
+## 9. As built
+
+Commits `e5ac1389` (the settle), `0bdff8c3` (`Cancel`), `efd62ea4` (graphs
+that end), and the docs commit on top.
+
+**Section 8's choices.**
+- **Names.** The scheduler operation is `AgentGraphScheduler::cancel_graph_state`,
+  and `cancel_graph_run` checks the plan, then calls it. The runner's write is
+  `AgentStepRunner::cancel_with_graph_state`. The result is
+  `AgentRunCancellation { transition, cancelled_node_ids, settled_entries }`,
+  `#[non_exhaustive]`.
+- **5.2's operation** is `AgentGraphEffectBridge::settle_cancelled_nodes`. The
+  rule itself is the free function `settle_cancelled_outbox_entries` beside it,
+  and the fleet's `settle_cancelled_effects` now calls it, so there is one copy
+  of the rule. Each settled entry is reported as `AgentSettledOutboxEntry`
+  with an `AgentOutboxSettlement` (`Cancelled`, `CancelledInFlight`). A
+  pending entry is cancelled under `GRAPH_NODE_CANCELLED_REASON`
+  (`graph-node-cancelled`).
+- **The bridge's outcome.** `AgentGraphEffectCommandOutcome` had public fields
+  and was not `#[non_exhaustive]`. It gains `settled_entries` and becomes
+  `#[non_exhaustive]`. No consumer in this repository or in rakka.host
+  constructs or destructures it.
+- **The crash fault** is a store wrapper in the test file whose `n`th
+  compare-and-set fails once. The workflow tests had no shared fault kit for
+  run and workflow stores together.
+- **`NodeCancelled`** sits after `NodeSkipped`. No doc lists the event kinds.
+- **The core's completion** settles through a crate-private
+  `AgentGraphRuntime::complete_node_settling`. The public `complete_node`,
+  which has only the runner, is unchanged, and its doc says it does not
+  settle.
+
+**Calls made while building** (each in the ledger):
+- `cancel_with_graph_state` refuses a graph that is not `Cancelled`
+  (`InvalidRunState`), so a run never ends cancelled over a running graph.
+  This guard was not in the design, and it has its own test.
+- `cancelled_node_ids` lists the changed nodes the cancel's state shows
+  `Cancelled`, not the bare changed list. Today the two are the same.
+- **Section 6's "a run whose graph already completed" row** cannot be
+  reached as written. A graph that completes through `update_graph_state`
+  ends the run `Completed`, and `request_cancellation` refuses an ended run.
+  The test drives the order that can happen: a cancel is requested, then the
+  graph completes (the run ends `Completed`, as before), then `Cancel` is
+  refused, with nothing left due.
+- **Section 6's combined row** (effects, a checkpoint and a loop instance in
+  one cancelled run) is split in two. The run-level tests cover effects and a
+  checkpoint. The loop instance is covered by
+  `cancel_graph_state_matches_cancel_graph_run`, which holds the state-only
+  cancel equal to `cancel_graph_run` over a running loop iteration. The run
+  core has no iterator operation.
+- **No product doc** describes graph-run cancellation. What `Cancel` settles is
+  in `docs/rakka-compatibility.md` and in the graph runbook's new section,
+  "Effects Due Under Cancelled Nodes".
+
+**Section 6's rows and their tests** (`crates/rakka-agent-workflow/tests/`):
+
+| Row | Test |
+| --- | --- |
+| The gap, first | `graph_cancellation.rs::a_cancelled_graph_run_sends_none_of_its_queued_effects`. Before the change it failed with one dispatch |
+| Effects and a checkpoint cancelled | `cancel_settles_a_checkpoints_approval_request` |
+| A loop instance | `graph_scheduler.rs::cancel_graph_state_matches_cancel_graph_run` |
+| An entry mid-dispatch | `an_entry_mid_dispatch_is_cancelled_with_its_attempt_counted` |
+| A resolved node with a still-cancellable entry | `only_the_nodes_the_transition_cancelled_are_settled` |
+| A crash between the settle and the run write | `a_crash_between_the_settle_and_the_run_write_converges`, whose repeat runs on a new core that recovers the same stores |
+| A run with no graph | `a_run_without_a_graph_cancels_as_before` |
+| A run whose graph already completed | `cancel_after_the_graph_completed_in_the_same_pass` |
+| `Cancel` on a `Cancelled` run | `cancel_on_a_cancelled_run_is_refused` |
+| A graph completing with a sibling due | `a_graph_completed_while_a_sibling_waits_settles_the_siblings_entry` |
+| A graph failing, both bridge paths | `a_graph_failed_by_an_effect_failure_settles_the_siblings_entry`, `an_abandon_decision_settles_the_siblings_entry` |
+| 5.2's operation on a transition that cancelled nothing | `a_transition_that_cancelled_nothing_settles_nothing` |
+| The actor's `Cancel` | `the_actor_answers_cancel_as_the_core_does` |
+| The two scheduler operations | `cancel_graph_state_matches_cancel_graph_run` |
+| `NodeCancelled` | `runtime_events.rs::node_cancelled_is_a_node_event` |
+
+The plan's Review Focus added:
+- `a_settle_that_fails_part_way_converges`;
+- `a_terminal_or_absent_entry_is_left_alone`;
+- `a_replayed_failure_command_settles_nothing_more`;
+- `the_hosts_own_cancel_sequence_still_works`.
+
+**Falsification.** Each break was applied, the suites run, and the break
+reverted:
+
+| Break | Tests that failed |
+| --- | --- |
+| Settle every node, not the changed and `Cancelled` ones | `only_the_nodes_the_transition_cancelled_are_settled`, `a_transition_that_cancelled_nothing_settles_nothing` |
+| Cancel an entry mid-dispatch without counting the attempt | `an_entry_mid_dispatch_is_cancelled_with_its_attempt_counted` |
+| Refuse an absent entry | `a_terminal_or_absent_entry_is_left_alone`, `a_settle_that_fails_part_way_converges` |
+| Settle nothing in `Cancel` | the gap test, the checkpoint test and the crash test |
+| Settle after the run write | the crash test |
+| Record the write as `GraphUpdated` | the gap test |
+| Drop the `Cancelled`-graph guard | `the_runner_cancels_with_a_graph_only_when_it_is_cancelled` |
+| Skip the settle in `complete_graph_node` | the completion test, `cancel_after_the_graph_completed_in_the_same_pass` |
+| Skip it in `accept_and_apply_effect_failed` | the effect-failure test, the replay test |
+| Skip it in `accept_and_apply_reconciliation_decision` | the `Abandon` test |
+
+**Drafts in `tmp/`, not filed:** `2026-11-27-step-run-cancel-leaves-entries-due.md`
+and `2026-11-27-iterator-bound-leaves-siblings-due.md`.

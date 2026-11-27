@@ -554,6 +554,11 @@ async fn a_crash_between_the_settle_and_the_run_write_converges() {
     );
     assert_eq!(run_status(&mut core), AgentRunStatus::Cancelling);
 
+    // The process that crashed is gone: a new core recovers the same stores.
+    drop(core);
+    let mut core = fixture.core(&run_id);
+    core.recover().await.expect("the core recovers");
+    assert_eq!(run_status(&mut core), AgentRunStatus::Cancelling);
     let cancellation = core.cancel(ts(510)).await.expect("the repeat finishes");
     assert_eq!(
         cancellation.transition.next_status,
