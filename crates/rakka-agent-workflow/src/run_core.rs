@@ -515,10 +515,15 @@ where
     /// Completes one running graph node. Recorded under
     /// `complete-graph-node`.
     ///
+    /// Completing a terminal node ends the graph `Completed` and cancels its
+    /// unresolved nodes. Their outbox entries are settled, under the
+    /// dispatcher fleet's rule, before the graph is persisted (issue #71
+    /// item 4), so a crash between the two leaves nothing of theirs due.
+    ///
     /// # Errors
     ///
-    /// The refresh's recovery failing, or the graph runtime refusing the
-    /// transition.
+    /// The refresh's recovery failing, the graph runtime refusing the
+    /// transition, or a settle's store write failing.
     pub async fn complete_graph_node(
         &mut self,
         plan: &AgentCompiledExecutionPlan,
@@ -529,7 +534,7 @@ where
             self.refresh_if_stale().await?;
             let result = self
                 .graph_runtime
-                .complete_node(&mut self.runner, plan, node_id, now)
+                .complete_node_settling(&mut self.runner, &mut self.inbox, plan, node_id, now)
                 .await;
             self.record_operation_result("complete-graph-node", &result);
             result

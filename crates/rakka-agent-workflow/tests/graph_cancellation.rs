@@ -14,19 +14,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCommandId, AgentCommandMetadata, AgentCompiledExecutionPlan,
-    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
-    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
-    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId, AgentDeduplicationKey,
-    AgentDurabilityMetadata, AgentEffectId, AgentEffectTarget, AgentGraphEffectBridge,
+    AgentCausationId, AgentCommand, AgentCommandId, AgentCommandMetadata,
+    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeTarget, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
+    AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffectId,
+    AgentEffectTarget, AgentGraphEffectBridge, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleRequest,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerTransition,
-    AgentGraphTerminalStatus, AgentOutboxSettlement, AgentRunActor, AgentRunActorCommand,
-    AgentRunCore, AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunRuntimeError,
-    AgentRunState, AgentRunStatus, AgentRunTransitionKind, AgentSettledOutboxEntry,
-    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, HumanDecisionOption, StateSchemaVersion, WorkflowDefinitionVersion,
+    AgentGraphNodeStatus, AgentGraphReconciliationDecision, AgentGraphRunState,
+    AgentGraphScheduler, AgentGraphSchedulerTransition, AgentGraphTerminalStatus,
+    AgentOutboxSettlement, AgentRunActor, AgentRunActorCommand, AgentRunCore, AgentRunEngineError,
+    AgentRunId, AgentRunInbox, AgentRunRuntimeError, AgentRunState, AgentRunStatus,
+    AgentRunTransitionKind, AgentSettledOutboxEntry, AgentStatePayload, AgentStep, AgentStepId,
+    AgentStepKind, AgentStepRunner, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
+    AgentWorkflowId, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    HumanDecisionOption, StateSchemaVersion, WorkflowDefinitionVersion,
     CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION, DISPATCH_CANCELLED_IN_FLIGHT_LINE,
 };
 use rakka_core::{ActorRef, ActorSystem};
@@ -715,6 +717,246 @@ async fn the_actor_answers_cancel_as_the_core_does() {
 }
 
 // ---------------------------------------------------------------------------
+// A graph that ends by completing or failing cancels its unresolved
+// siblings, and settles their entries before it is persisted (design 5.3a).
+// ---------------------------------------------------------------------------
+
+/// The core completes the terminal node while a sibling waits on its effect:
+/// the graph ends `Completed`, the sibling is cancelled, and its entry is
+/// settled, so a dispatch pass afterwards sends nothing.
+#[tokio::test]
+async fn a_graph_completed_while_a_sibling_waits_settles_the_siblings_entry() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-complete-sibling");
+    let plan = effect_beside_terminal_plan();
+    let (mut core, effect_id) = core_with_sibling_scheduled(&fixture, &run_id, &plan).await;
+
+    let completed = core
+        .complete_graph_node(&plan, node("terminal"), ts(300))
+        .await
+        .expect("the terminal completes the graph");
+
+    let graph = &completed.graph_transition.state;
+    assert_eq!(
+        graph.terminal_status,
+        Some(AgentGraphTerminalStatus::Completed)
+    );
+    assert_eq!(
+        graph.node_states[&node("effect")].status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        completed.run_transition.next_status,
+        AgentRunStatus::Completed
+    );
+    let mut dispatcher = CountingDispatcher::default();
+    let parts = core.parts_mut();
+    assert_eq!(
+        entry(parts.inbox, &effect_id).status(),
+        OutboxStatus::Cancelled
+    );
+    parts
+        .inbox
+        .inner_mut()
+        .dispatch_due_outbox(&mut dispatcher)
+        .await
+        .expect("the dispatch pass runs");
+    assert_eq!(
+        dispatcher.dispatched, 0,
+        "a cancelled sibling's effect is not sent"
+    );
+}
+
+/// An effect failure that fails the graph settles its sibling's entry before
+/// the bridge hands the transition back, and reports it. The failed node's
+/// own entry is left to the dispatcher that failed it.
+#[tokio::test]
+async fn a_graph_failed_by_an_effect_failure_settles_the_siblings_entry() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = two_effect_plan();
+    let run = "run-fail-sibling";
+    let (mut inbox, _store) = recovered_inbox(run).await;
+    let (failed_id, sibling_id, state) =
+        two_effects_scheduled(&bridge, &plan, &mut inbox, run).await;
+    let command = effect_failure(
+        &bridge,
+        &plan,
+        run,
+        "cmd-effect-a-exhausted",
+        &failed_id,
+        AgentGraphEffectFailureDisposition::Exhausted,
+    );
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("the exhausted failure fails the graph");
+
+    assert_eq!(
+        outcome.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    assert_eq!(
+        settled_pairs(&outcome.settled_entries),
+        vec![(sibling_id.clone(), AgentOutboxSettlement::Cancelled)]
+    );
+    assert_eq!(
+        entry(&inbox, &sibling_id).status(),
+        OutboxStatus::Cancelled,
+        "settled before the owner persists anything"
+    );
+    assert_eq!(entry(&inbox, &failed_id).status(), OutboxStatus::Pending);
+}
+
+/// An `Abandon` decision on a parked node fails the graph, and settles the
+/// sibling's entry the same way. The park itself cancels nothing.
+#[tokio::test]
+async fn an_abandon_decision_settles_the_siblings_entry() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = two_effect_plan();
+    let run = "run-abandon-sibling";
+    let (mut inbox, _store) = recovered_inbox(run).await;
+    let (parked_id, sibling_id, state) =
+        two_effects_scheduled(&bridge, &plan, &mut inbox, run).await;
+    inbox
+        .inner_mut()
+        .record_outbox_exhausted(&message_id(&parked_id), "effect-outcome-unknown")
+        .await
+        .expect("the entry exhausts");
+    let reconcile = effect_failure(
+        &bridge,
+        &plan,
+        run,
+        "cmd-effect-a-reconcile",
+        &parked_id,
+        AgentGraphEffectFailureDisposition::Reconcile,
+    );
+    let parked = bridge
+        .accept_and_apply_effect_failed(&plan, state, reconcile, &mut inbox)
+        .await
+        .expect("the node parks");
+    assert!(parked.settled_entries.is_empty(), "a park cancels nothing");
+    assert_eq!(entry(&inbox, &sibling_id).status(), OutboxStatus::Pending);
+    let decision = bridge
+        .reconciliation_decision_command(
+            command_metadata(&plan, AgentRunId::new(run), "cmd-effect-a-abandon", 400),
+            parked_id,
+            AgentGraphReconciliationDecision::Abandon {
+                error_code: "effect-abandoned".to_string(),
+            },
+        )
+        .expect("the decision command builds");
+
+    let abandoned = bridge
+        .accept_and_apply_reconciliation_decision(
+            &plan,
+            parked.transition.state,
+            decision,
+            &mut inbox,
+        )
+        .await
+        .expect("the abandon fails the graph");
+
+    assert_eq!(
+        abandoned.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    assert_eq!(
+        settled_pairs(&abandoned.settled_entries),
+        vec![(sibling_id.clone(), AgentOutboxSettlement::Cancelled)]
+    );
+    assert_eq!(entry(&inbox, &sibling_id).status(), OutboxStatus::Cancelled);
+}
+
+/// A failure command re-delivered after the owner lost its persist: the
+/// inbox answers it as a duplicate, the transition is recomputed the same,
+/// and the settle finds the sibling's entry already settled.
+#[tokio::test]
+async fn a_replayed_failure_command_settles_nothing_more() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = two_effect_plan();
+    let run = "run-fail-replayed";
+    let (mut inbox, _store) = recovered_inbox(run).await;
+    let (failed_id, sibling_id, state) =
+        two_effects_scheduled(&bridge, &plan, &mut inbox, run).await;
+    let command = effect_failure(
+        &bridge,
+        &plan,
+        run,
+        "cmd-effect-a-replayed",
+        &failed_id,
+        AgentGraphEffectFailureDisposition::Exhausted,
+    );
+    let first = bridge
+        .accept_and_apply_effect_failed(&plan, state.clone(), command.clone(), &mut inbox)
+        .await
+        .expect("the failure applies");
+    assert_eq!(first.settled_entries.len(), 1);
+
+    let replayed = bridge
+        .accept_and_apply_effect_failed(&plan, state, command, &mut inbox)
+        .await
+        .expect("the replay applies");
+
+    assert!(replayed.acceptance.is_duplicate());
+    assert_eq!(replayed.transition, first.transition);
+    assert!(
+        replayed.settled_entries.is_empty(),
+        "nothing more to settle: {:?}",
+        replayed.settled_entries
+    );
+    assert_eq!(entry(&inbox, &sibling_id).status(), OutboxStatus::Cancelled);
+}
+
+/// A cancel requested while the graph runs, then the graph completes in the
+/// same pass. The completion ends the run `Completed` (as it did) and
+/// settles the cancelled sibling's entry, so the cancel that follows is
+/// refused as it was, with nothing left due.
+#[tokio::test]
+async fn cancel_after_the_graph_completed_in_the_same_pass() {
+    let fixture = CoreFixture::new();
+    let run_id = AgentRunId::new("run-core-cancel-after-complete");
+    let plan = effect_beside_terminal_plan();
+    let (mut core, effect_id) = core_with_sibling_scheduled(&fixture, &run_id, &plan).await;
+    request_cancellation(&mut core).await;
+    let completed = core
+        .complete_graph_node(&plan, node("terminal"), ts(450))
+        .await
+        .expect("the terminal completes the graph");
+    assert_eq!(
+        completed.run_transition.next_status,
+        AgentRunStatus::Completed
+    );
+
+    let refused = core
+        .cancel(ts(500))
+        .await
+        .expect_err("a completed run is not cancelled");
+    assert!(
+        matches!(
+            &refused,
+            AgentRunRuntimeError::RunEngine {
+                error: AgentRunEngineError::InvalidTransition { .. }
+            }
+        ),
+        "{refused:?}"
+    );
+    let mut dispatcher = CountingDispatcher::default();
+    let parts = core.parts_mut();
+    assert_eq!(
+        entry(parts.inbox, &effect_id).status(),
+        OutboxStatus::Cancelled
+    );
+    parts
+        .inbox
+        .inner_mut()
+        .dispatch_due_outbox(&mut dispatcher)
+        .await
+        .expect("the dispatch pass runs");
+    assert_eq!(dispatcher.dispatched, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Fixtures.
 // ---------------------------------------------------------------------------
 
@@ -1219,4 +1461,88 @@ fn run_status(core: &mut TestCore) -> AgentRunStatus {
         .expect("the runner reads")
         .expect("the run exists")
         .status
+}
+
+/// `input` → `effect` (a tool call), and `input` → `terminal` directly: the
+/// graph can complete while `effect` still waits.
+fn effect_beside_terminal_plan() -> AgentCompiledExecutionPlan {
+    let terminal =
+        AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+            AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Input, "input"),
+        );
+    plan_shell("plan-cancel-effect-beside-terminal")
+        .node(input_node())
+        .node(tool_node("effect", "effect-result"))
+        .node(terminal)
+        .edge(AgentCompiledPlanEdge::new(
+            "edge-input-effect",
+            "input",
+            "payload",
+            "effect",
+            "payload",
+        ))
+        .edge(AgentCompiledPlanEdge::new(
+            "edge-input-terminal",
+            "input",
+            "payload",
+            "terminal",
+            "payload",
+        ))
+}
+
+/// A core on [`effect_beside_terminal_plan`] with `effect`'s effect
+/// scheduled and `terminal` started.
+async fn core_with_sibling_scheduled(
+    fixture: &CoreFixture,
+    run_id: &AgentRunId,
+    plan: &AgentCompiledExecutionPlan,
+) -> (TestCore, AgentEffectId) {
+    let mut core = core_with_started(fixture, run_id, plan, &["effect", "terminal"]).await;
+    let effect_id = core
+        .schedule_graph_node_effect(plan, effect_request(run_id.clone(), "effect", 160))
+        .await
+        .expect("the effect schedules")
+        .effect_outcome
+        .effect
+        .effect_id;
+    (core, effect_id)
+}
+
+/// Both effects of [`two_effect_plan`] scheduled: `effect-a`'s id,
+/// `effect-b`'s id, and the graph state.
+async fn two_effects_scheduled(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    inbox: &mut TestInbox,
+    run: &str,
+) -> (AgentEffectId, AgentEffectId, AgentGraphRunState) {
+    let (first, state) = schedule(
+        bridge,
+        plan,
+        inbox,
+        run,
+        "effect-a",
+        two_running_effects_state(plan),
+    )
+    .await;
+    let (second, state) = schedule(bridge, plan, inbox, run, "effect-b", state).await;
+    (first, second, state)
+}
+
+fn effect_failure(
+    bridge: &AgentGraphEffectBridge,
+    plan: &AgentCompiledExecutionPlan,
+    run: &str,
+    command_id: &str,
+    effect_id: &AgentEffectId,
+    disposition: AgentGraphEffectFailureDisposition,
+) -> AgentCommand {
+    bridge
+        .effect_failed_command(
+            command_metadata(plan, AgentRunId::new(run), command_id, 300),
+            effect_id.clone(),
+            "effect-outcome-unknown",
+            disposition,
+        )
+        .expect("the failure command builds")
 }

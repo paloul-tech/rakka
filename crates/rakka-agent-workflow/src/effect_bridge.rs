@@ -1295,7 +1295,12 @@ impl AgentGraphEffectBridge {
     /// Accepts an effect failure command and applies it to graph state.
     ///
     /// Retry-scheduled failures keep the graph node waiting. Exhausted or
-    /// terminal failures fail the node and the graph. A `Reconcile`
+    /// terminal failures fail the node and the graph, which cancels the
+    /// graph's unresolved nodes: their outbox entries are settled before the
+    /// transition is returned, and reported in the outcome's
+    /// `settled_entries` (issue #71 item 4). The owner persists the
+    /// transition after; a crash before that leaves the command accepted,
+    /// and its re-application settles nothing more. A `Reconcile`
     /// disposition parks the node on a person; it is refused before
     /// acceptance, with [`AgentGraphEffectBridgeError::EffectNotTerminal`],
     /// unless the effect's outbox entry is already `Exhausted` or
@@ -1321,17 +1326,20 @@ impl AgentGraphEffectBridge {
         }
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_effect_failed_command(plan, state, &command)?;
+        let settled_entries = self.settle_cancelled_nodes(inbox, &transition).await?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
-            settled_entries: Vec::new(),
+            settled_entries,
         })
     }
 
     /// Accepts a reconciliation decision and applies it to graph state.
     ///
     /// `NotExecuted` resumes the parked node as running on its next effect
-    /// generation; `Abandon` fails the node and the graph under its code. A
+    /// generation; `Abandon` fails the node and the graph under its code,
+    /// settling the outbox entries of the nodes that cancels as an effect
+    /// failure does ([`Self::accept_and_apply_effect_failed`]). A
     /// decision on a node that has resolved is a no-op; one on a node that
     /// was never parked is refused with
     /// [`AgentGraphEffectBridgeError::InvalidNodeStatus`]. An `Abandon`
@@ -1352,10 +1360,11 @@ impl AgentGraphEffectBridge {
         ensure_decision_has_a_cause(&state, &command)?;
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_reconciliation_decision_command(plan, state, &command)?;
+        let settled_entries = self.settle_cancelled_nodes(inbox, &transition).await?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
-            settled_entries: Vec::new(),
+            settled_entries,
         })
     }
 
