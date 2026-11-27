@@ -768,6 +768,12 @@ where
     /// run and settles nothing more. Every other run takes the runner's own
     /// cancel, and its result lists nothing cancelled or settled.
     ///
+    /// An entry mid-dispatch is cancelled whatever holds it, which is safe
+    /// under the core's single-writer contract: the owner is the run's only
+    /// dispatcher. A dispatcher outside that contract that records an
+    /// outcome later rewrites the cancelled entry
+    /// ([`settle_cancelled_outbox_entries`](crate::settle_cancelled_outbox_entries)).
+    ///
     /// # Errors
     ///
     /// The refresh's recovery failing, a settle's store write failing (the

@@ -824,6 +824,15 @@ pub const GRAPH_NODE_CANCELLED_REASON: &str = "graph-node-cancelled";
 /// write that fails returns its error. The entries written before it stay
 /// settled, and a repeat settles the rest.
 ///
+/// **Call it as the entries' only dispatcher.** The fleet cancels a
+/// `Dispatching` row only when no worker holds a live lease on it. This
+/// function sees no leases, so it cancels every `Dispatching` entry it is
+/// given. An outcome recorded later on a cancelled entry rewrites it: a
+/// failure with attempts left puts it back to `Failed` with a retry, so the
+/// cancelled effect is sent again, and a success marks it `Dispatched`. A caller that is not the
+/// entries' one dispatcher, as [`crate::AgentRunCore`]'s owner is, leaves out
+/// the entries under a live attempt.
+///
 /// # Errors
 ///
 /// The inbox not being recovered, or a store write failing.
@@ -1234,6 +1243,10 @@ impl AgentGraphEffectBridge {
     /// transition it computed itself calls it first. Settling first makes a
     /// crash in between harmless: the entries are settled and the transition
     /// is still unpersisted, and a repeat settles nothing more.
+    ///
+    /// It cancels an entry mid-dispatch whatever holds it, so its caller must
+    /// be the entries' only dispatcher
+    /// ([`settle_cancelled_outbox_entries`] says why).
     ///
     /// # Errors
     ///
