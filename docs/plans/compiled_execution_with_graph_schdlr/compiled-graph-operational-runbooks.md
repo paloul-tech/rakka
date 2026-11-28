@@ -172,6 +172,54 @@ Actions:
   should self-heal back to `Waiting`; see "Recovery: In-Flight Effect
   Re-Linking" above before intervening.
 
+## Runbook: Effects Due Under Cancelled Nodes
+
+Symptoms:
+
+- A dispatcher sends an effect of a run that is `Cancelled`, `Completed` or
+  `Failed`.
+- A graph node is `Cancelled` while its outbox entry is still `Pending`,
+  `Failed` with a retry scheduled, or `Dispatching`.
+
+What settles them (issue #71 item 4). The run core and the effect bridge
+settle a graph's leftover nodes' outbox entries before the transition that
+cancels them is persisted, on these paths:
+
+- `AgentRunCore::cancel`, or the actor's `Cancel`, on a cancelling graph run;
+- the core's `complete_graph_node`, when a terminal node ends the graph;
+- `accept_and_apply_effect_failed` and `accept_and_apply_reconciliation_decision`
+  (`Abandon`), when they fail the graph.
+
+An entry whose attempt had started is cancelled with that attempt counted
+under `DISPATCH_CANCELLED_IN_FLIGHT_LINE`: the attempt may have reached its
+target, so reconcile it by idempotency key before assuming it did not run.
+The settle cancels an entry mid-dispatch whatever holds it. It is safe for
+the run's one dispatcher only: an outcome another dispatcher records later
+rewrites the cancelled entry, and a failure with attempts left puts it back
+to `Failed` with a retry, so the effect is sent again.
+
+Actions:
+
+- An entry of a `Cancelled` node that is still due was persisted by a write
+  the owner composed without settling: a scheduler call persisted through
+  `update_graph_state`, `AgentGraphRuntime::complete_node`, or a build before
+  this change. Fix the write to call
+  `AgentGraphEffectBridge::settle_cancelled_nodes` on the transition before
+  persisting it.
+- A run an earlier build cancelled through `Cancel` left its graph unended:
+  the run is `Cancelled` while its nodes are still `Running` or `Waiting`.
+  Their entries are those nodes' `scheduled_effect_ids`.
+- To clear entries already left due, call `settle_cancelled_outbox_entries`
+  on the run's inbox with the `scheduled_effect_ids` of the `Cancelled`
+  nodes, or of the unresolved nodes of a run an earlier build cancelled. It
+  cancels only what is still cancellable, and is safe to repeat. Call it
+  only where nothing else dispatches the run's entries, or after leaving
+  out any entry under a live attempt: a `Dispatching` entry it cancels is
+  rewritten by an outcome recorded later.
+- Two cases are not settled by Rakka: a cancelled run with no graph (its
+  `schedule_effect` entries), and an iterator that exceeds its bound, which
+  fails the graph without cancelling its siblings.
+
 ## Runbook: Failed Graph Effects
 
 Symptoms:

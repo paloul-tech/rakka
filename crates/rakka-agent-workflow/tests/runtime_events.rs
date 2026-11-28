@@ -293,3 +293,32 @@ fn graph_state(scheduler_revision: u64, last_event_sequence: u64) -> AgentGraphR
     graph.last_event_sequence = last_event_sequence;
     graph
 }
+
+/// A cancelled node has its own event kind (issue #71 item 4), a node event
+/// like the others: it carries its node id, and a draft without one is
+/// refused.
+#[test]
+fn node_cancelled_is_a_node_event() {
+    let kind = AgentRuntimeEventKind::NodeCancelled;
+    assert!(AgentRuntimeEventKind::all().contains(&kind));
+    assert_eq!(kind.as_label(), "node-cancelled");
+    assert_eq!(
+        AgentRuntimeEventKind::from_label("node-cancelled"),
+        Some(kind)
+    );
+
+    let graph = graph_state(1, 0);
+    let error = event_draft(kind)
+        .after_persistence(Some(&graph))
+        .expect_err("a node event without its node id is refused");
+    assert_eq!(error.code(), "invalid-runtime-event");
+
+    let event = event_draft(kind)
+        .node_id(AgentCompiledNodeId::new("node-1"))
+        .after_persistence(Some(&graph))
+        .expect("the draft finalizes")
+        .expect("persistence succeeded, so there is an event");
+    validate_runtime_event(&event).expect("the event validates");
+    let value = serde_json::to_value(&event).expect("the event serializes");
+    assert_eq!(value["kind"], json!("node-cancelled"));
+}

@@ -762,11 +762,122 @@ impl std::str::FromStr for AgentGraphEffectFailureDisposition {
 
 /// Result of accepting and applying one effect callback command.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AgentGraphEffectCommandOutcome {
     /// Durable inbox acceptance result.
     pub acceptance: AgentInboxAcceptance,
     /// Graph state transition after applying the accepted command.
     pub transition: AgentGraphSchedulerTransition,
+    /// The outbox entries this call settled, of the nodes the transition
+    /// cancelled ([`AgentGraphEffectBridge::settle_cancelled_nodes`]). Empty
+    /// when the transition cancelled no node, or every entry had already
+    /// finished.
+    pub settled_entries: Vec<AgentSettledOutboxEntry>,
+}
+
+/// What a settle did to one outbox entry of a cancelled node (issue #71
+/// item 4).
+///
+/// The rule is the dispatcher fleet's ([`settle_cancelled_outbox_entries`]):
+/// an entry whose attempt started is cancelled with that attempt counted, a
+/// pending or retry-scheduled one is cancelled, and a finished or absent one
+/// is left alone and not reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentOutboxSettlement {
+    /// A pending or retry-scheduled entry, cancelled before any further
+    /// attempt started.
+    Cancelled,
+    /// An entry whose attempt had started and whose outcome was never
+    /// recorded, cancelled with that attempt counted under
+    /// [`crate::DISPATCH_CANCELLED_IN_FLIGHT_LINE`]. The attempt may have
+    /// reached its target.
+    CancelledInFlight,
+}
+
+/// One outbox entry a settle wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentSettledOutboxEntry {
+    /// The effect whose entry was settled; its outbox message id is the
+    /// effect id.
+    pub effect_id: AgentEffectId,
+    /// What the settle did to it.
+    pub settlement: AgentOutboxSettlement,
+}
+
+/// The reason a graph's cancelled node's pending outbox entry is cancelled
+/// under.
+pub const GRAPH_NODE_CANCELLED_REASON: &str = "graph-node-cancelled";
+
+/// Settles the outbox entries of `effect_ids` as cancelled, under the
+/// dispatcher fleet's rule, and returns the entries it wrote, in order.
+///
+/// - **An entry mid-dispatch** (`Dispatching`) is cancelled with its attempt
+///   counted, under [`crate::DISPATCH_CANCELLED_IN_FLIGHT_LINE`], so it still
+///   says the attempt started (issue #209).
+/// - **A pending or retry-scheduled entry** is cancelled under `reason`.
+/// - **A finished entry, or one the outbox no longer holds** (compacted
+///   away), is left alone and not reported.
+///
+/// Idempotent: a repeat finds every entry it settled already finished. A
+/// write that fails returns its error. The entries written before it stay
+/// settled, and a repeat settles the rest.
+///
+/// **Call it as the entries' only dispatcher.** The fleet cancels a
+/// `Dispatching` row only when no worker holds a live lease on it. This
+/// function sees no leases, so it cancels every `Dispatching` entry it is
+/// given. An outcome recorded later on a cancelled entry rewrites it: a
+/// failure with attempts left puts it back to `Failed` with a retry, so the
+/// cancelled effect is sent again, and a success marks it `Dispatched`. A caller that is not the
+/// entries' one dispatcher, as [`crate::AgentRunCore`]'s owner is, leaves out
+/// the entries under a live attempt.
+///
+/// # Errors
+///
+/// The inbox not being recovered, or a store write failing.
+pub async fn settle_cancelled_outbox_entries<Store, Clock>(
+    inbox: &mut AgentRunInbox<Store, Clock>,
+    effect_ids: &[AgentEffectId],
+    reason: &str,
+) -> Result<Vec<AgentSettledOutboxEntry>, AgentInboxError>
+where
+    Store: DurableStateStore<WorkflowState>,
+    Clock: WorkflowClock,
+{
+    let mut settled = Vec::new();
+    for effect_id in effect_ids {
+        let message_id = OutboxMessageId::new(effect_id.as_str());
+        let status = inbox
+            .inner()
+            .state()?
+            .outbox_entry(&message_id)
+            .filter(|entry| entry.is_cancellable())
+            .map(rakka_workflow::OutboxEntry::status);
+        let settlement = match status {
+            Some(OutboxStatus::Dispatching) => inbox
+                .inner_mut()
+                .record_outbox_cancelled_in_flight(
+                    &message_id,
+                    crate::DISPATCH_CANCELLED_IN_FLIGHT_LINE,
+                )
+                .await?
+                .map(|_| AgentOutboxSettlement::CancelledInFlight),
+            Some(_) => inbox
+                .inner_mut()
+                .record_outbox_cancelled(&message_id, reason)
+                .await?
+                .map(|_| AgentOutboxSettlement::Cancelled),
+            None => None,
+        };
+        if let Some(settlement) = settlement {
+            settled.push(AgentSettledOutboxEntry {
+                effect_id: effect_id.clone(),
+                settlement,
+            });
+        }
+    }
+    Ok(settled)
 }
 
 /// Bridge from compiled graph effect nodes to durable agent outbox effects.
@@ -1115,6 +1226,57 @@ impl AgentGraphEffectBridge {
         Ok(command)
     }
 
+    /// Settles the outbox entries of every node `transition` cancelled, before
+    /// the transition is persisted (issue #71 item 4).
+    ///
+    /// A node counts when it is in `transition.changed_node_ids` and the
+    /// transition's state shows it `Cancelled`. Its entries are those its
+    /// `scheduled_effect_ids` name, which include the approval request its
+    /// human checkpoint opened. They are settled under
+    /// [`settle_cancelled_outbox_entries`]'s rule, with
+    /// [`GRAPH_NODE_CANCELLED_REASON`].
+    ///
+    /// Call it after computing a transition that may cancel leftover nodes,
+    /// and before persisting that transition: a run's cancel, a graph
+    /// completing at a terminal node, or a graph failing. The run core and
+    /// this bridge's failure paths call it themselves. An owner persisting a
+    /// transition it computed itself calls it first. Settling first makes a
+    /// crash in between harmless: the entries are settled and the transition
+    /// is still unpersisted, and a repeat settles nothing more.
+    ///
+    /// It cancels an entry mid-dispatch whatever holds it, so its caller must
+    /// be the entries' only dispatcher
+    /// ([`settle_cancelled_outbox_entries`] says why).
+    ///
+    /// # Errors
+    ///
+    /// The inbox not being recovered, or a store write failing, which leaves
+    /// the entries written before it settled.
+    pub async fn settle_cancelled_nodes<Store, Clock>(
+        &self,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+        transition: &AgentGraphSchedulerTransition,
+    ) -> AgentGraphEffectBridgeResult<Vec<AgentSettledOutboxEntry>>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        let effect_ids: Vec<AgentEffectId> = transition
+            .changed_node_ids
+            .iter()
+            .filter_map(|node_id| transition.state.node_states.get(node_id))
+            .filter(|node_state| node_state.status == AgentGraphNodeStatus::Cancelled)
+            .flat_map(|node_state| node_state.scheduled_effect_ids.iter().cloned())
+            .collect();
+        if effect_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            settle_cancelled_outbox_entries(inbox, &effect_ids, GRAPH_NODE_CANCELLED_REASON)
+                .await?,
+        )
+    }
+
     /// Accepts an effect completion command and applies it to graph state.
     ///
     /// Duplicate inbox acceptance is still applied if graph state has not yet
@@ -1139,13 +1301,19 @@ impl AgentGraphEffectBridge {
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
+            settled_entries: Vec::new(),
         })
     }
 
     /// Accepts an effect failure command and applies it to graph state.
     ///
     /// Retry-scheduled failures keep the graph node waiting. Exhausted or
-    /// terminal failures fail the node and the graph. A `Reconcile`
+    /// terminal failures fail the node and the graph, which cancels the
+    /// graph's unresolved nodes: their outbox entries are settled before the
+    /// transition is returned, and reported in the outcome's
+    /// `settled_entries` (issue #71 item 4). The owner persists the
+    /// transition after; a crash before that leaves the command accepted,
+    /// and its re-application settles nothing more. A `Reconcile`
     /// disposition parks the node on a person; it is refused before
     /// acceptance, with [`AgentGraphEffectBridgeError::EffectNotTerminal`],
     /// unless the effect's outbox entry is already `Exhausted` or
@@ -1171,16 +1339,20 @@ impl AgentGraphEffectBridge {
         }
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_effect_failed_command(plan, state, &command)?;
+        let settled_entries = self.settle_cancelled_nodes(inbox, &transition).await?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
+            settled_entries,
         })
     }
 
     /// Accepts a reconciliation decision and applies it to graph state.
     ///
     /// `NotExecuted` resumes the parked node as running on its next effect
-    /// generation; `Abandon` fails the node and the graph under its code. A
+    /// generation; `Abandon` fails the node and the graph under its code,
+    /// settling the outbox entries of the nodes that cancels as an effect
+    /// failure does ([`Self::accept_and_apply_effect_failed`]). A
     /// decision on a node that has resolved is a no-op; one on a node that
     /// was never parked is refused with
     /// [`AgentGraphEffectBridgeError::InvalidNodeStatus`]. An `Abandon`
@@ -1201,9 +1373,11 @@ impl AgentGraphEffectBridge {
         ensure_decision_has_a_cause(&state, &command)?;
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_reconciliation_decision_command(plan, state, &command)?;
+        let settled_entries = self.settle_cancelled_nodes(inbox, &transition).await?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
+            settled_entries,
         })
     }
 
@@ -1229,6 +1403,7 @@ impl AgentGraphEffectBridge {
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
+            settled_entries: Vec::new(),
         })
     }
 
@@ -1254,6 +1429,7 @@ impl AgentGraphEffectBridge {
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
+            settled_entries: Vec::new(),
         })
     }
 }

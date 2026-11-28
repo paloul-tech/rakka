@@ -45,6 +45,9 @@ pub enum AgentRuntimeEventKind {
     NodeCompleted,
     /// A graph node was skipped.
     NodeSkipped,
+    /// A graph node was cancelled before it resolved: the run was cancelled,
+    /// or the graph ended while the node was unresolved.
+    NodeCancelled,
     /// A graph node failed.
     NodeFailed,
     /// A durable effect was scheduled.
@@ -90,6 +93,7 @@ impl AgentRuntimeEventKind {
             Self::NodeStarted,
             Self::NodeCompleted,
             Self::NodeSkipped,
+            Self::NodeCancelled,
             Self::NodeFailed,
             Self::EffectScheduled,
             Self::EffectCompleted,
@@ -119,6 +123,7 @@ impl AgentRuntimeEventKind {
             Self::NodeStarted => "node-started",
             Self::NodeCompleted => "node-completed",
             Self::NodeSkipped => "node-skipped",
+            Self::NodeCancelled => "node-cancelled",
             Self::NodeFailed => "node-failed",
             Self::EffectScheduled => "effect-scheduled",
             Self::EffectCompleted => "effect-completed",
@@ -154,6 +159,7 @@ impl AgentRuntimeEventKind {
                 | Self::NodeStarted
                 | Self::NodeCompleted
                 | Self::NodeSkipped
+                | Self::NodeCancelled
                 | Self::NodeFailed
                 | Self::BranchSelected
                 | Self::LoopIterationStarted

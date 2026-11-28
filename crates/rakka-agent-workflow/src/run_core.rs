@@ -35,11 +35,27 @@ use crate::runtime::{
 };
 use crate::{
     AgentCommand, AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentDueEffect, AgentEffect,
-    AgentEffectId, AgentGraphEffectScheduleRequest, AgentGraphRunProjection, AgentInboxAcceptance,
-    AgentInboxError, AgentOutboxAcceptance, AgentOutboxResult, AgentRunId, AgentRunInbox,
-    AgentRunState, AgentRunTransition, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
+    AgentEffectId, AgentGraphEffectScheduleRequest, AgentGraphNodeStatus, AgentGraphRunProjection,
+    AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxResult, AgentRunId,
+    AgentRunInbox, AgentRunState, AgentRunStatus, AgentRunTransition, AgentRunWaitReason,
+    AgentSettledOutboxEntry, AgentStepRunner, AgentStepSuccess, AgentTimestampMillis,
+    AgentWorkflow, AgentWorkflowSnapshotRegistry,
 };
+
+/// What a run's cancel did ([`AgentRunCore::cancel`], issue #71 item 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentRunCancellation {
+    /// The persisted run transition, recorded as
+    /// [`AgentRunTransitionKind::Cancel`](crate::AgentRunTransitionKind::Cancel).
+    pub transition: AgentRunTransition,
+    /// The graph nodes this cancel cancelled, sorted by node id. Empty for a
+    /// run with no graph, or one whose graph had already ended.
+    pub cancelled_node_ids: Vec<AgentCompiledNodeId>,
+    /// The outbox entries of those nodes this call settled, in node order.
+    /// A repeat after a crash lists only what it wrote itself.
+    pub settled_entries: Vec<AgentSettledOutboxEntry>,
+}
 
 /// The core's own runner and inbox, borrowed together, for a write its owner
 /// composes from upstream's transitions ([`AgentRunCore::parts_mut`] has the
@@ -499,10 +515,15 @@ where
     /// Completes one running graph node. Recorded under
     /// `complete-graph-node`.
     ///
+    /// Completing a terminal node ends the graph `Completed` and cancels its
+    /// unresolved nodes. Their outbox entries are settled, under the
+    /// dispatcher fleet's rule, before the graph is persisted (issue #71
+    /// item 4), so a crash between the two leaves nothing of theirs due.
+    ///
     /// # Errors
     ///
-    /// The refresh's recovery failing, or the graph runtime refusing the
-    /// transition.
+    /// The refresh's recovery failing, the graph runtime refusing the
+    /// transition, or a settle's store write failing.
     pub async fn complete_graph_node(
         &mut self,
         plan: &AgentCompiledExecutionPlan,
@@ -513,7 +534,7 @@ where
             self.refresh_if_stale().await?;
             let result = self
                 .graph_runtime
-                .complete_node(&mut self.runner, plan, node_id, now)
+                .complete_node_settling(&mut self.runner, &mut self.inbox, plan, node_id, now)
                 .await;
             self.record_operation_result("complete-graph-node", &result);
             result
@@ -731,24 +752,95 @@ where
 
     /// Marks a cancelling run cancelled. Recorded under `cancel`.
     ///
+    /// A cancelling run whose graph has not ended is cancelled whole (issue
+    /// #71 item 4), in this order:
+    /// 1. the graph's cancel is computed from its durable state
+    ///    ([`AgentGraphScheduler::cancel_graph_state`](crate::AgentGraphScheduler::cancel_graph_state));
+    /// 2. the outbox entries of the nodes it cancelled are settled
+    ///    ([`AgentGraphEffectBridge::settle_cancelled_nodes`](crate::AgentGraphEffectBridge::settle_cancelled_nodes)):
+    ///    a pending or retrying entry is cancelled, and one whose attempt
+    ///    started is cancelled with that attempt counted;
+    /// 3. the cancelled graph and the run's `Cancelled` status are written in
+    ///    one transition recorded as `Cancel`.
+    ///
+    /// The entries are settled before the write, so a crash between them
+    /// leaves the run cancelling with nothing due, and a repeat finishes the
+    /// run and settles nothing more. Every other run takes the runner's own
+    /// cancel, and its result lists nothing cancelled or settled.
+    ///
+    /// An entry mid-dispatch is cancelled whatever holds it, which is safe
+    /// under the core's single-writer contract: the owner is the run's only
+    /// dispatcher. A dispatcher outside that contract that records an
+    /// outcome later rewrites the cancelled entry
+    /// ([`settle_cancelled_outbox_entries`](crate::settle_cancelled_outbox_entries)).
+    ///
     /// # Errors
     ///
-    /// The refresh's recovery failing, or the runner refusing the transition.
+    /// The refresh's recovery failing, a settle's store write failing (the
+    /// entries written before it stay settled), or the runner refusing the
+    /// transition.
     pub async fn cancel(
         &mut self,
         now: AgentTimestampMillis,
-    ) -> AgentRunRuntimeResult<AgentRunTransition> {
+    ) -> AgentRunRuntimeResult<AgentRunCancellation> {
         Box::pin(async move {
             self.refresh_if_stale().await?;
-            let result = self
-                .runner
-                .cancel(now)
-                .await
-                .map_err(AgentRunRuntimeError::from);
+            let result = self.cancel_run(now).await;
             self.record_operation_result("cancel", &result);
             result
         })
         .await
+    }
+
+    /// The cancel's body, after the refresh.
+    async fn cancel_run(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentRunRuntimeResult<AgentRunCancellation> {
+        let unended_graph = self
+            .runner
+            .state()?
+            .filter(|state| state.status == AgentRunStatus::Cancelling)
+            .and_then(|state| state.graph_state.clone())
+            .filter(|graph| graph.terminal_status.is_none());
+        let Some(graph) = unended_graph else {
+            let transition = self.runner.cancel(now).await?;
+            return Ok(AgentRunCancellation {
+                transition,
+                cancelled_node_ids: Vec::new(),
+                settled_entries: Vec::new(),
+            });
+        };
+        let cancelled = self
+            .graph_runtime
+            .scheduler()
+            .cancel_graph_state(graph, now)?;
+        let settled_entries = self
+            .graph_runtime
+            .effect_bridge()
+            .settle_cancelled_nodes(&mut self.inbox, &cancelled)
+            .await?;
+        let cancelled_node_ids = cancelled
+            .changed_node_ids
+            .iter()
+            .filter(|node_id| {
+                cancelled
+                    .state
+                    .node_states
+                    .get(*node_id)
+                    .is_some_and(|node| node.status == AgentGraphNodeStatus::Cancelled)
+            })
+            .cloned()
+            .collect();
+        let transition = self
+            .runner
+            .cancel_with_graph_state(cancelled.state, now)
+            .await?;
+        Ok(AgentRunCancellation {
+            transition,
+            cancelled_node_ids,
+            settled_entries,
+        })
     }
 
     /// Moves a failed run into compensation. Recorded under

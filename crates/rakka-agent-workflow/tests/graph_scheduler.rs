@@ -1306,3 +1306,101 @@ fn park_waiting_node_requires_a_cause_code() {
         "{error:?}"
     );
 }
+
+/// The state-only cancel a run's cancel uses (issue #71 item 4) answers
+/// exactly what the plan's cancel answers: over a node waiting on an effect,
+/// over a running loop iteration, over a graph already cancelled, and in what
+/// it refuses.
+#[test]
+fn cancel_graph_state_matches_cancel_graph_run() {
+    let scheduler = AgentGraphScheduler::new();
+    let linear = linear_plan();
+    let waiting = {
+        let state = scheduler
+            .initialize_state(&linear, ts(100))
+            .expect("graph state should initialize");
+        let state = scheduler
+            .mark_ready_nodes_runnable(&linear, state, ts(110))
+            .expect("input should become runnable")
+            .state;
+        let state = scheduler
+            .start_node(&linear, state, "input", ts(120))
+            .expect("input should start")
+            .state;
+        scheduler
+            .wait_node(
+                &linear,
+                state,
+                "input",
+                AgentGraphWaitReason::Effect,
+                ts(130),
+            )
+            .expect("input should wait for effect")
+            .state
+    };
+    let iterator = iterator_plan(3);
+    let iterating = scheduler
+        .start_iterator_iteration(
+            &iterator,
+            start_iterator(&scheduler, &iterator),
+            "iterate",
+            ts(170),
+        )
+        .expect("iteration 0 should start")
+        .state;
+    assert_eq!(iterating.loop_instances.len(), 1);
+
+    for (plan, state) in [(&linear, waiting), (&iterator, iterating)] {
+        let from_plan = scheduler
+            .cancel_graph_run(plan, state.clone(), ts(300))
+            .expect("the plan's cancel cancels");
+        let from_state = scheduler
+            .cancel_graph_state(state, ts(300))
+            .expect("the state's cancel cancels");
+        assert_eq!(from_state, from_plan);
+        assert!(!from_state.changed_node_ids.is_empty());
+
+        let again = scheduler
+            .cancel_graph_state(from_state.state.clone(), ts(310))
+            .expect("a cancelled graph is answered unchanged");
+        assert_eq!(again.state, from_state.state);
+        assert!(again.changed_node_ids.is_empty());
+    }
+
+    let mut completed = scheduler
+        .initialize_state(&linear, ts(100))
+        .expect("graph state should initialize");
+    for (offset, node) in (0u64..).zip(["input", "transform", "terminal"]) {
+        completed = run_node(&scheduler, &linear, completed, node, ts(110 + offset * 10));
+    }
+    assert_eq!(
+        completed.terminal_status,
+        Some(AgentGraphTerminalStatus::Completed)
+    );
+    let refused = scheduler
+        .cancel_graph_state(completed.clone(), ts(300))
+        .expect_err("a completed graph is refused");
+    assert_eq!(
+        refused,
+        AgentGraphSchedulerError::TerminalGraph {
+            status: AgentGraphTerminalStatus::Completed
+        }
+    );
+    assert_eq!(
+        Err(refused),
+        scheduler.cancel_graph_run(&linear, completed, ts(300))
+    );
+
+    let mut newer = scheduler
+        .initialize_state(&linear, ts(100))
+        .expect("graph state should initialize");
+    newer.graph_schema_version = AgentGraphStateSchemaVersion::new(3);
+    let refused = scheduler
+        .cancel_graph_state(newer.clone(), ts(300))
+        .expect_err("a newer schema is refused");
+    assert_eq!(refused.code(), "graph-state-schema-unsupported");
+    assert_eq!(
+        Err(refused),
+        scheduler.cancel_graph_run(&linear, newer, ts(300))
+    );
+}

@@ -37,9 +37,9 @@ use crate::{
     AgentGraphEffectScheduleRequest, AgentGraphRunProjection, AgentGraphRunState,
     AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphSchedulerTransition,
     AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError,
-    AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunState, AgentRunTransition,
-    AgentRunWaitReason, AgentStepRunner, AgentStepSuccess, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowSnapshotRegistry,
+    AgentRunCancellation, AgentRunEngineError, AgentRunId, AgentRunInbox, AgentRunState,
+    AgentRunTransition, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
+    AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
 };
 
 /// Shared result type for actor-backed agent run runtime operations.
@@ -273,6 +273,15 @@ impl AgentGraphRuntime {
     }
 
     /// Completes one running graph node and persists the run state.
+    ///
+    /// Completing a terminal node ends the graph `Completed` and cancels its
+    /// unresolved nodes. This helper has only the runner, so it does not
+    /// settle those nodes' outbox entries: an owner calling it settles them
+    /// first, with
+    /// [`AgentGraphEffectBridge::settle_cancelled_nodes`](crate::AgentGraphEffectBridge::settle_cancelled_nodes)
+    /// on the transition it computes. The run core's
+    /// [`complete_graph_node`](crate::AgentRunCore::complete_graph_node)
+    /// settles them itself (issue #71 item 4).
     pub async fn complete_node<RunStore>(
         &self,
         runner: &mut AgentStepRunner<RunStore>,
@@ -286,6 +295,32 @@ impl AgentGraphRuntime {
         validate_graph_plan_matches_runner(runner, plan)?;
         let graph = current_graph_state(runner)?;
         let transition = self.scheduler.complete_node(plan, graph, node_id, now)?;
+        persist_graph_transition(runner, transition, now).await
+    }
+
+    /// Completes one running graph node as [`Self::complete_node`] does, but
+    /// settles the outbox entries of the nodes the completion cancelled
+    /// before persisting (issue #71 item 4). The run core's
+    /// `complete_graph_node`.
+    pub(crate) async fn complete_node_settling<RunStore, WorkflowStore, Clock>(
+        &self,
+        runner: &mut AgentStepRunner<RunStore>,
+        inbox: &mut AgentRunInbox<WorkflowStore, Clock>,
+        plan: &AgentCompiledExecutionPlan,
+        node_id: AgentCompiledNodeId,
+        now: AgentTimestampMillis,
+    ) -> AgentRunRuntimeResult<AgentGraphRuntimeTransition>
+    where
+        RunStore: DurableStateStore<AgentRunState>,
+        WorkflowStore: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        validate_graph_plan_matches_runner(runner, plan)?;
+        let graph = current_graph_state(runner)?;
+        let transition = self.scheduler.complete_node(plan, graph, node_id, now)?;
+        self.effect_bridge
+            .settle_cancelled_nodes(inbox, &transition)
+            .await?;
         persist_graph_transition(runner, transition, now).await
     }
 
@@ -557,12 +592,15 @@ pub enum AgentRunActorCommand {
         /// Reply channel for the persisted transition.
         reply_to: ReplyTo<AgentRunRuntimeResult<AgentRunTransition>>,
     },
-    /// Mark a cancelling run cancelled.
+    /// Mark a cancelling run cancelled: a run with a graph is cancelled
+    /// whole, its nodes and their outbox entries with it
+    /// ([`AgentRunCore::cancel`](crate::AgentRunCore::cancel)).
     Cancel {
         /// Transition timestamp.
         now: AgentTimestampMillis,
-        /// Reply channel for the persisted transition.
-        reply_to: ReplyTo<AgentRunRuntimeResult<AgentRunTransition>>,
+        /// Reply channel for the cancellation: the persisted transition, the
+        /// nodes it cancelled and the outbox entries it settled.
+        reply_to: ReplyTo<AgentRunRuntimeResult<AgentRunCancellation>>,
     },
     /// Move a failed run into compensation.
     BeginCompensation {

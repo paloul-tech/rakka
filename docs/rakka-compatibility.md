@@ -1201,6 +1201,39 @@ Agent-domain telemetry names are a compatibility surface of their own, because a
 
   **Mixed builds and rollback.** Nothing durable changes. A host that sends either command without `telemetry` to a newer build gets no `resume-request` on the resolution; an older build ignores a newer host's `telemetry`, because `AgentRunEntityCommand` denies no unknown field (`child_wait_segments.rs::commands_without_a_trace_context_decode_to_an_empty_one`).
 
+- Issue #71, item 4 ("a graph run's cancellation leaves its nodes' effects due"): **every transition the run core persists, or the effect bridge hands back, that cancels a graph's leftover nodes settles their outbox entries before it is persisted.** This is behaviour-breaking and source-breaking. **No durable field, status, schema version or error code is added.**
+
+  **Why.** Cancelling a graph resolved its unfinished nodes `Cancelled` in the graph state and left their outbox entries due. `dispatch_due_outbox` sends any entry that is due, whatever the run's state, so a cancelled run's queued effect still reached its target, and so did a sibling's when a graph completed or failed. rakka.host worked around it with its own cancel sequence and a dispatcher guard.
+
+  **The rule** is the dispatcher fleet's (issue #209), now in one function, `settle_cancelled_outbox_entries`, which the fleet's cancellation calls too:
+  - an entry whose attempt started (`Dispatching`) is cancelled with that attempt counted under `DISPATCH_CANCELLED_IN_FLIGHT_LINE`, because it may have reached its target;
+  - a `Pending` or retry-scheduled `Failed` entry is cancelled under `graph-node-cancelled` (`GRAPH_NODE_CANCELLED_REASON`);
+  - a finished entry, or one compacted away, is left alone.
+
+  A node's entries are those its `scheduled_effect_ids` name, which include the approval request its human checkpoint opened.
+
+  **One condition the fleet has and the rule cannot check.** The fleet cancels a `Dispatching` row only when no worker holds a live lease on it. The shared function sees no leases, so it cancels every `Dispatching` entry it is given. An outcome recorded later on a cancelled entry rewrites it: a failure with attempts left puts it back to `Failed` with a retry, so the cancelled effect is sent again, and a success marks it `Dispatched`. The settle is therefore safe only for the entries' one dispatcher, which an `AgentRunCore` owner is under its single-writer contract. A caller that is not leaves out the entries under a live attempt. The owner declined the alternative, a status guard in `rakka-workflow`'s inbox.
+
+  **Where it runs** (`rakka-agent-workflow`):
+  - **`AgentRunCore::cancel`, and the actor's `Cancel`,** on a `Cancelling` run whose graph has not ended. It computes the graph's cancel from durable state with the new `AgentGraphScheduler::cancel_graph_state` (`cancel_graph_run` checks the plan, then answers the same). It settles, then writes the cancelled graph and the `Cancelled` run in one transition recorded as `Cancel`, through the new `AgentStepRunner::cancel_with_graph_state`, which clears `current_step_id` and sets `completed_at`. Before, `Cancel` changed only the run's status and left the graph unended. A run with no graph, or whose graph has ended, takes the runner's own cancel as before.
+  - **The core's `complete_graph_node`,** when the completed node is terminal and the graph ends `Completed`. Its signature and result are unchanged.
+  - **`accept_and_apply_effect_failed`** (an exhausted or terminal failure) **and `accept_and_apply_reconciliation_decision`** (`Abandon`), which fail the graph. Each settles before it returns the transition, and reports what it settled in the outcome's new `settled_entries`.
+  - **`AgentGraphEffectBridge::settle_cancelled_nodes(inbox, transition)`,** new, for an owner that persists a transition it computed itself. It settles the entries of the nodes the transition changed and left `Cancelled`, and is idempotent.
+
+  **Settle, then persist.** A crash between the two leaves the entries settled and the transition unpersisted. A repeat of the same operation recomputes the transition, settles nothing more, and persists. A replayed failure command is answered as a duplicate by the inbox, and its outcome lists only what that call settled: nothing, unless the first application failed part-way.
+
+  **What a host meets.**
+  - **Compile breaks.**
+    - `AgentRunActorCommand::Cancel`'s reply is `AgentRunRuntimeResult<AgentRunCancellation>`, and `AgentRunCore::cancel` returns `AgentRunCancellation` (`transition`, `cancelled_node_ids`, `settled_entries`; `#[non_exhaustive]`). A sender that wanted the transition reads `.transition`.
+    - `AgentRuntimeEventKind` gains `NodeCancelled` (`node-cancelled`), a node event. An exhaustive match adds the arm; `rakka-a2a` keeps it private, like every node event.
+    - `AgentGraphEffectCommandOutcome` gains `settled_entries` and is now `#[non_exhaustive]`, so a struct literal, or a pattern that names every field, stops compiling.
+  - **A write the owner composes settles only if the owner settles.** Upstream cannot reach a scheduler call (`cancel_graph_run`, `fail_node`, `fail_waiting_node`, `complete_node`) that the owner persists through `update_graph_state`, nor `AgentGraphRuntime::complete_node`, which has only the runner. The owner calls `settle_cancelled_nodes` on the transition before persisting it. Until it does, those runs keep the gap, and a dispatcher guard of the owner's own still covers them.
+  - **A host that cancels its graph itself first,** persisting `cancel_graph_run` through `update_graph_state` and then sending `Cancel`, finds `Cancel` refused as before, because its own write already ended the run. Its entries stay due unless it settles them.
+
+  **Not covered.** A cancelled run with no graph keeps its `schedule_effect` entries due. An iterator that exceeds its bound fails the graph without cancelling its siblings, so their entries stay due. Only an owner that drives iterators through the scheduler itself reaches it, since the run core has no iterator operation (#71 item 2); the entries left due are its sibling nodes', which the bridge schedules as usual.
+
+  **Mixed builds and rollback.** Nothing durable changes shape. A cancelled entry is a status every build reads, and the run record a graph run's `Cancel` writes is the record a cancelled graph persisted through `update_graph_state` always wrote. An older build's `Cancel` changes only the run's status again.
+
 Run the default compatibility matrix:
 
 ```sh

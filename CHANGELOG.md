@@ -6,6 +6,20 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 
 ## Unreleased
 
+### Changed
+
+- **Behaviour-breaking, `rakka-agent-workflow`** (issue #71 item 4): **a graph's cancelled nodes no longer leave their effects due.** Cancelling a graph resolved its unfinished nodes `Cancelled` and left their outbox entries due, and `dispatch_due_outbox` sends whatever is due, so a cancelled run's queued effect still reached its target, and so did a sibling's when a graph completed or failed. Every transition the run core persists, or the effect bridge hands back, that cancels a graph's leftover nodes now settles their entries under the dispatcher fleet's rule before it is persisted: an entry whose attempt started is cancelled with that attempt counted under `DISPATCH_CANCELLED_IN_FLIGHT_LINE`, a pending or retrying one is cancelled under `graph-node-cancelled`, and a finished one is left alone. A node's entries include its checkpoint's approval request. Unlike the fleet, the settle sees no leases and cancels any entry mid-dispatch, so it is safe only for the entries' one dispatcher, as an `AgentRunCore` owner is: an outcome recorded later on a cancelled entry rewrites it, and a failure with attempts left sends the effect again.
+  - **`Cancel` does the whole job.** `AgentRunCore::cancel`, and the actor's `Cancel`, on a cancelling run whose graph has not ended, compute the graph's cancel from durable state (the new `AgentGraphScheduler::cancel_graph_state`), settle, then write the cancelled graph and the `Cancelled` run in one transition recorded as `Cancel` (the new `AgentStepRunner::cancel_with_graph_state`), with the step cleared and the end time set. Before, `Cancel` changed only the run's status and left the graph running. A run with no graph cancels as before.
+  - **Graphs that end settle too:** the core's `complete_graph_node` when a terminal node ends the graph `Completed`, and `accept_and_apply_effect_failed` and `accept_and_apply_reconciliation_decision` (`Abandon`) when they fail it. The two bridge entry points report what they settled in the outcome's new `settled_entries`.
+  - **Settle, then persist,** on every path: a crash between the two leaves the entries settled, and a repeat settles nothing more.
+  - **An owner that persists a transition it computed itself** (a scheduler call through `update_graph_state`, or `AgentGraphRuntime::complete_node`, which has only the runner and does not settle) calls the new `AgentGraphEffectBridge::settle_cancelled_nodes` first. `settle_cancelled_outbox_entries` is the rule itself; the fleet's cancellation now calls it.
+  - **Source-breaking:** `Cancel`'s reply, and `AgentRunCore::cancel`'s result, is the new `AgentRunCancellation` (`transition`, `cancelled_node_ids`, `settled_entries`); `AgentRuntimeEventKind` gains `NodeCancelled` (`node-cancelled`), which `rakka-a2a` keeps private like every node event; `AgentGraphEffectCommandOutcome` gains `settled_entries` and becomes `#[non_exhaustive]`.
+  - **Not covered:** a cancelled run with no graph keeps its `schedule_effect` entries due, and an iterator that exceeds its bound fails the graph without cancelling its siblings. No durable field, status, schema version or error code is added. Design in `docs/superpowers/specs/2026-11-27-graph-cancellation-design.md`; compatibility notes in `docs/rakka-compatibility.md`.
+
+### Validation
+
+- `rakka-agent-workflow`: `graph_cancellation.rs` holds the settle on every path (issue #71 item 4). Its first test reproduces the gap: on the code before the change, a cancelled graph run's queued effect was dispatched once. Others hold an entry mid-dispatch cancelled with its attempt counted, a resolved node's still-cancellable approval request left alone, a settle that fails part-way, a crash between the settle and the run's write, the actor answering as the core does, and a completing graph, an effect failure, an `Abandon` and a replayed failure command each settling a sibling. Each guard was broken in turn and its test failed.
+
 ## 0.2.0 (2026-11-27)
 
 ### Added
