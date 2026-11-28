@@ -104,3 +104,53 @@ cases must fail, and the fourth must still pass.
   `child_wait_segments.rs::forget_exchanges` does.
 - Where the first two tests live. The third extends
   `tests/child_wait_segments.rs`.
+
+## As built
+
+Commits `08a6cb18` (the change and its tests) and the docs commit on top.
+
+- **The change.** `accept_assignment`'s creating branch records the envelope's
+  context, when it carries one, after `run.check_bounds(..)` and before the
+  run is stored. The write at the end of `apply` is gone, with a one-line
+  comment left in its place pointing to the new site.
+- **The tests' assignments** come from a new `tests/common` helper,
+  `assignment_envelope(fixture, generation)`, addressed to the generation-1
+  run whatever the generation. `forget_exchanges` moved to `tests/common`
+  unchanged, and `run_context` reads the run's context from a recovered
+  facade.
+
+**Calls made while building:**
+- **A run created without a context** got its own test,
+  `a_run_created_without_a_context_takes_none_from_a_later_assignment`. It
+  covers both a repeat and a refused generation.
+- **The replay test** asserts the reply was applied, not answered from the
+  journal. The falsification below shows the transition ran: restoring the
+  old write fails it.
+- **The catalogue's last sentence** said storing the park identity "would
+  remove only the first" cause. That was wrong before this change, since
+  storing would have removed the rewrite cause, which is not the first. With
+  this change it would remove none of the causes for a park committed now,
+  and the sentence now says so.
+- **The compatibility doc's issue #70 entry** stated the same "rewrote" cause
+  and is narrowed the same way. The released 0.2.0 changelog text is left as
+  it was.
+
+**The proof rows and their tests:**
+
+| Row | Test |
+| --- | --- |
+| A refused generation | `assignment_context.rs::a_refused_generation_leaves_the_runs_trace_context` |
+| The same generation re-sent past the journal window | `the_same_generation_sent_again_leaves_the_runs_trace_context` |
+| A run created without a context | `a_run_created_without_a_context_takes_none_from_a_later_assignment` |
+| A child wait across a refusal | `child_wait_segments.rs::a_refused_assignment_between_the_park_and_the_resolution_keeps_the_park_link` |
+| The first acceptance | `trace_scenarios.rs::ingress_context_flows_to_every_effect_and_survives_owner_loss`, unchanged |
+
+**Red, then falsification:**
+- On the code before the change, all four new tests failed on their context
+  assertions: the run took the other message's context, and the
+  `wait-resolve` link named a span nobody exported. The 12 existing
+  child-wait tests passed.
+- Restoring the old write fails exactly the four new tests, and trace
+  scenario 23 still passes.
+- Removing the new write, so that nothing records a context, fails scenario
+  23 and nine other traced tests.
