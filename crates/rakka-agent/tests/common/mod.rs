@@ -3945,3 +3945,87 @@ pub async fn assert_gate_invariant<A: AgentModelAdapter, S: AgentRunEffectSink>(
         );
     }
 }
+
+/// An assignment for the generation-1 run's address under `generation`, as a
+/// sender other than the task builds it (issue #224). The task never sends
+/// one for another generation, since a run's id names its generation; a test
+/// builds it to reach the run's refusal. It carries no trace context: a test
+/// adds one with `with_telemetry`.
+pub fn assignment_envelope(
+    fixture: &Fixture,
+    generation: rakka_agent::AgentAssignmentGeneration,
+) -> AgentExchangeEnvelope {
+    let assignment = rakka_agent::AgentRunAssignment {
+        task: task_scope(),
+        run: run_scope(),
+        generation,
+        definition: task_definition(),
+        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the content is inline-bounded"),
+        goal: None,
+        budget: rakka_agent::AgentBudgetGrant::unbounded(),
+        agent_definition_revision: AgentRevisionNumber::new(1),
+        agent_settings_revision: AgentRevisionNumber::new(1),
+        delegation: None,
+        assigned_at: fixture.now(),
+    };
+    let payload =
+        AgentExchangePayload::encode(rakka_agent::AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE, &assignment)
+            .expect("the assignment encodes");
+    let operation_id = rakka_agent::assignment_operation_id(&task_scope(), generation)
+        .expect("the operation id derives");
+    AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::Assignment,
+        AgentEntityAddress::Task(task_scope()),
+        AgentEntityAddress::Run(run_scope()),
+        payload,
+        AgentCorrelationId::new(operation_id.as_str()),
+        fixture.now(),
+    )
+    .expect("the envelope is valid")
+}
+
+/// The run's trace context, read from the durable record by a facade of its
+/// own.
+pub async fn run_context(fixture: &Fixture) -> rakka_agent_workflow::AgentTelemetryContext {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.state()
+        .expect("state")
+        .loop_state()
+        .expect("the run exists")
+        .telemetry()
+        .clone()
+}
+
+/// Ages the run's exchange journal past its window by record surgery, as
+/// `forget_operations` does for a command log, rather than 64 other
+/// exchanges: a delivery after this one is not answered from the journal,
+/// so its transition runs again.
+pub async fn forget_exchanges(fixture: &Fixture) {
+    use rakka_persistence::DurableStateStore;
+    let id = run_scope().persistence_id();
+    let record = fixture
+        .runs
+        .load(&id)
+        .await
+        .expect("the store loads")
+        .expect("the record exists");
+    let mut encoded = serde_json::to_value(&record.state).expect("the state encodes");
+    let journal = encoded
+        .get_mut("journal")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the run state has an exchange journal");
+    assert!(
+        journal.contains_key("applied"),
+        "the journal has a window to forget"
+    );
+    journal.insert("applied".to_string(), serde_json::json!([]));
+    let state = serde_json::from_value(encoded).expect("the rewritten state decodes");
+    fixture
+        .runs
+        .compare_and_set(&id, record.revision, state)
+        .await
+        .expect("the rewrite lands");
+}

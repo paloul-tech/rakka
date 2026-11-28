@@ -335,37 +335,6 @@ async fn deliver_reply(
         .expect("the delivery is answered")
 }
 
-/// Ages the run's exchange journal past its window by record surgery, as
-/// `forget_operations` does for a command log, rather than 64 other
-/// exchanges: a delivery after this one is not answered from the journal,
-/// so its transition runs again.
-async fn forget_exchanges(fixture: &Fixture) {
-    use rakka_persistence::DurableStateStore;
-    let id = run_scope().persistence_id();
-    let record = fixture
-        .runs
-        .load(&id)
-        .await
-        .expect("the store loads")
-        .expect("the record exists");
-    let mut encoded = serde_json::to_value(&record.state).expect("the state encodes");
-    let journal = encoded
-        .get_mut("journal")
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("the run state has an exchange journal");
-    assert!(
-        journal.contains_key("applied"),
-        "the journal has a window to forget"
-    );
-    journal.insert("applied".to_string(), serde_json::json!([]));
-    let state = serde_json::from_value(encoded).expect("the rewritten state decodes");
-    fixture
-        .runs
-        .compare_and_set(&id, record.revision, state)
-        .await
-        .expect("the rewrite lands");
-}
-
 /// A duplicate of the result that resolved the group resolves nothing more,
 /// in the journal's window, where the journal answers it, and past it, where
 /// its transition runs again and the first writer wins: either way the run
@@ -660,4 +629,45 @@ async fn an_await_in_a_later_turn_parks_in_a_crank_step() {
         .parked_span_identity(&run_scope(), &run_context)
         .expect("a traced run derives the park's identity");
     assert_eq!(waits[0].span_id.as_deref(), Some(identity.span_id.as_str()));
+}
+
+/// A refused assignment between the park and the resolution leaves the run's
+/// trace context as it was, so the resolution derives the identity the park
+/// exported and its `parked-wait` link names that span (issue #224). Before,
+/// the refused message's context became the run's, and the link named a span
+/// nobody exported.
+#[tokio::test]
+async fn a_refused_assignment_between_the_park_and_the_resolution_keeps_the_park_link() {
+    let sink = Arc::new(InMemoryAgentSegmentSink::new());
+    let fixture = parked_fan_out(&sink).await;
+    let refused = deliver_reply(
+        &fixture,
+        &assignment_envelope(&fixture, rakka_agent::AgentAssignmentGeneration::new(2))
+            .with_telemetry(context(HOST_PARENT)),
+    )
+    .await;
+    assert!(
+        !refused.result().is_accepted(),
+        "another generation is refused: {:?}",
+        refused.result()
+    );
+
+    let children = committed_children(&fixture).await;
+    let (first, second) = results(&fixture, &children);
+    assert!(deliver(&fixture, &first)
+        .await
+        .expect("the first result is taken"));
+    assert!(deliver(&fixture, &second)
+        .await
+        .expect("the second result is taken"));
+
+    let resolves = closed(&sink, "wait-resolve");
+    assert_eq!(resolves.len(), 1, "{:?}", sink.operations());
+    let wait = &closed(&sink, "wait")[0];
+    assert!(wait.span_id.is_some(), "a traced park has an identity");
+    assert_eq!(
+        link_of(&resolves[0], LINK_KIND_PARKED_WAIT).map(|link| link.span_id.as_str()),
+        wait.span_id.as_deref(),
+        "the resolution links the park it ended"
+    );
 }
