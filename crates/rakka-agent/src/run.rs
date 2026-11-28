@@ -2051,7 +2051,7 @@ fn accept_assignment(
         loop_state.set_delegation_envelope(*envelope);
     }
 
-    let run = AgentRun {
+    let mut run = AgentRun {
         binding,
         generation: assignment.generation,
         definition: assignment.definition,
@@ -2067,6 +2067,21 @@ fn accept_assignment(
     // to hold the turn it was created to take.
     if let Err(error) = run.check_bounds(AGENT_RUN_STATE_GROWTH_RESERVE_BYTES) {
         return refuse(error.code(), error.to_string());
+    }
+    // The run's context is the assignment's that created it: an entity never
+    // invents one, and a context-less assignment leaves the run without one
+    // ([specification 17.5]). Recorded in the same compare-and-set as the
+    // acceptance, so every effect the ensuing transitions commit carries the
+    // causal chain the ingress started. Recorded here and nowhere else (issue
+    // #224): a refused generation, or a repeat of this assignment under
+    // another context, never reaches it, so the run never adopts a context it
+    // turned away or a later message's. A child's delegation result carries
+    // the *child's* context, which links into the run's spans rather than
+    // replacing its chain ([specification 17.4]). Recorded after the bounds
+    // check, as before, so admission is unchanged.
+    if envelope.has_telemetry() {
+        run.loop_state
+            .record_telemetry(envelope.telemetry().clone());
     }
 
     let generation = run.generation;
@@ -8089,20 +8104,9 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 format!("a run entity does not receive a {kind} exchange"),
             ),
         };
-        // The accepting segment's context is the exchange's: an entity never
-        // invents one, and a context-less exchange leaves the previous
-        // segment's context in place ([specification 17.5]). Recorded in the
-        // same compare-and-set as the acceptance, so every effect the ensuing
-        // transitions commit carries the causal chain the ingress started.
-        // Scoped to the assignment: a child's delegation result carries the
-        // *child's* context, which links into the parent's spans rather than
-        // replacing its causal chain ([specification 17.4]).
-        if envelope.kind() == AgentExchangeKind::Assignment && envelope.has_telemetry() {
-            if let Some(run) = state.run.as_mut() {
-                run.loop_state
-                    .record_telemetry(envelope.telemetry().clone());
-            }
-        }
+        // The run's trace context is recorded where its assignment creates
+        // it (`accept_assignment`), never here: no other answer to an
+        // exchange changes it (issue #224).
         AgentExchangeTransition::new(result)
     }
 
