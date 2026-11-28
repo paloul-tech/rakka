@@ -127,13 +127,18 @@ Commits `08a6cb18` (the change and its tests) and the docs commit on top.
   journal. The falsification below shows the transition ran: restoring the
   old write fails it.
 - **The catalogue's last sentence** said storing the park identity "would
-  remove only the first" cause. That was wrong before this change, since
-  storing would have removed the rewrite cause, which is not the first. With
-  this change it would remove none of the causes for a park committed now,
-  and the sentence now says so.
-- **The compatibility doc's issue #70 entry** stated the same "rewrote" cause
-  and is narrowed the same way. The released 0.2.0 changelog text is left as
-  it was.
+  remove only the first" cause. That was wrong, since storing removes the
+  rewrite cause, which is not the first. It now says storing would remove only
+  the rewrite, which a build with this fix no longer makes.
+- **The rewrite cause is narrowed by build, not by record** (final review): a
+  park committed now can still be orphaned by an earlier build, in a mixed or
+  rolled-back fleet, that accepts a hand-built assignment. The catalogue and
+  the compatibility doc's issue #70 entry both say "on a build from before
+  issue #224's fix". The released 0.2.0 changelog text is left as it was.
+- **The loop state's rustdoc** (final review): the `telemetry` field,
+  `telemetry()` and `record_telemetry` described the context as the last
+  committing segment's. They now describe it as the creating assignment's,
+  recorded once.
 
 **The proof rows and their tests:**
 

@@ -348,12 +348,12 @@ checked against the writers in both directions by
 **A link can point at a span nobody exported.** A `parked-wait` link names
 the identity the park derived, and no span was exported under it when the
 park was committed by a build from before issue #70, while no segment sink was
-wired, or under a run context that a later `Assignment` rewrote in a record
-written before issue #224's fix. A tail sampler that drops the park span has
-the same effect, routinely. A link to an absent span is valid OpenTelemetry;
-read it as a park the backend does not hold, not as an error. Storing the
-identity would remove none of these causes for a park committed now, so it is
-derived.
+wired, or under a run context that a later `Assignment` rewrote on a build
+from before issue #224's fix. A tail sampler that drops the park span has the
+same effect, routinely. A link to an absent span is valid OpenTelemetry; read
+it as a park the backend does not hold, not as an error. Storing the identity
+would remove only the rewrite, which a build with that fix no longer makes, so
+it is derived.
 
 `error.type` is a bounded vocabulary, held as data in
 `AGENT_SEGMENT_ERROR_TYPES` and checked against the call sites in both

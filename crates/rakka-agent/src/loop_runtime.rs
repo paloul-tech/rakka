@@ -411,9 +411,10 @@ pub struct AgentLoopState {
     /// next entry's monotonic order key is stable across a re-driven transition.
     #[serde(default, skip_serializing_if = "is_zero")]
     session_sequence: u64,
-    /// Trace context of the bounded segment that last committed this state —
-    /// what a resume after plain passivation links back to when no checkpoint,
-    /// effect, or timer holds the parked span
+    /// Trace context of the assignment that created this run, recorded once
+    /// when the run is created and never changed by a later exchange (issue
+    /// #224). It is what a resume after plain passivation links back to when
+    /// no checkpoint, effect, or timer holds the parked span
     /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)). Every
     /// effect a transition commits is stamped from it. Observability only,
     /// never correctness: a loop state persisted before this field decodes to
@@ -629,19 +630,23 @@ impl AgentLoopState {
         }
     }
 
-    /// Records the trace context of the bounded segment committing this state.
+    /// Records the run's trace context.
+    ///
+    /// The run participant calls it once, when an assignment creates the run,
+    /// with the context that assignment carried (issue #224). A refusal or a
+    /// repeat of the assignment never reaches it, so the context does not
+    /// follow later exchanges. A caller that records a context afterwards
+    /// replaces the one every later segment and derived span identity reads.
     ///
     /// The context is admitted through
     /// [`crate::observability::sanitize_agent_telemetry_context`]: strict on
     /// write so the read side never has to fail closed over telemetry. An
-    /// entity never invents context — it records what the command that
-    /// activated it carried, or leaves the previous segment's context in
-    /// place.
+    /// entity never invents context: a run created without one keeps none.
     pub fn record_telemetry(&mut self, telemetry: AgentTelemetryContext) {
         self.telemetry = crate::observability::sanitize_agent_telemetry_context(telemetry);
     }
 
-    /// Trace context of the bounded segment that last committed this state.
+    /// Trace context of the assignment that created this run.
     #[must_use]
     pub const fn telemetry(&self) -> &AgentTelemetryContext {
         &self.telemetry
